@@ -38,7 +38,7 @@ You have unmerged paths.
 Unmerged paths:
   (use "git add/rm <file>..." as appropriate to mark resolution)
 
-	deleted by us:      foo
+	deleted by us:   foo
 
 no changes added to commit (use "git add" and/or "git commit -a")
 EOF
@@ -106,7 +106,7 @@ test_expect_success 'git diff-index --cached -M shows 2 added + 1 unmerged' '
 	A	THREE
 	A	TWO
 	EOF
-	git diff-index --cached --name-status HEAD >actual &&
+	git diff-index --cached -M --name-status HEAD >actual &&
 	test_cmp expected actual
 '
 
@@ -142,8 +142,8 @@ You have unmerged paths.
 Unmerged paths:
   (use "git add/rm <file>..." as appropriate to mark resolution)
 
-	both added:         conflict.txt
-	deleted by them:    main.txt
+	both added:      conflict.txt
+	deleted by them: main.txt
 
 no changes added to commit (use "git add" and/or "git commit -a")
 EOF
@@ -175,9 +175,9 @@ You have unmerged paths.
 Unmerged paths:
   (use "git add/rm <file>..." as appropriate to mark resolution)
 
-	both deleted:       main.txt
-	added by them:      sub_master.txt
-	added by us:        sub_second.txt
+	both deleted:    main.txt
+	added by them:   sub_master.txt
+	added by us:     sub_second.txt
 
 no changes added to commit (use "git add" and/or "git commit -a")
 EOF
@@ -203,7 +203,7 @@ Changes to be committed:
 Unmerged paths:
   (use "git rm <file>..." to mark resolution)
 
-	both deleted:       main.txt
+	both deleted:    main.txt
 
 Untracked files not listed (use -u option to show untracked files)
 EOF
@@ -213,5 +213,19 @@ EOF
 	git checkout master
 '
 
+test_expect_success 'status --branch with detached HEAD' '
+	git reset --hard &&
+	git checkout master^0 &&
+	git status --branch --porcelain >actual &&
+	cat >expected <<-EOF &&
+	## HEAD (no branch)
+	?? .gitconfig
+	?? actual
+	?? expect
+	?? expected
+	?? mdconflict/
+	EOF
+	test_i18ncmp expected actual
+'
 
 test_done

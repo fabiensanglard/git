@@ -1,49 +1,83 @@
 #include "cache.h"
 #include "pkt-line.h"
+#include "run-command.h"
 
 char packet_buffer[LARGE_PACKET_MAX];
 static const char *packet_trace_prefix = "git";
-static const char trace_key[] = "GIT_TRACE_PACKET";
+static struct trace_key trace_packet = TRACE_KEY_INIT(PACKET);
+static struct trace_key trace_pack = TRACE_KEY_INIT(PACKFILE);
 
 void packet_trace_identity(const char *prog)
 {
 	packet_trace_prefix = xstrdup(prog);
 }
 
+static const char *get_trace_prefix(void)
+{
+	return in_async() ? "sideband" : packet_trace_prefix;
+}
+
+static int packet_trace_pack(const char *buf, unsigned int len, int sideband)
+{
+	if (!sideband) {
+		trace_verbatim(&trace_pack, buf, len);
+		return 1;
+	} else if (len && *buf == '\1') {
+		trace_verbatim(&trace_pack, buf + 1, len - 1);
+		return 1;
+	} else {
+		/* it's another non-pack sideband */
+		return 0;
+	}
+}
+
 static void packet_trace(const char *buf, unsigned int len, int write)
 {
 	int i;
 	struct strbuf out;
+	static int in_pack, sideband;
 
-	if (!trace_want(trace_key))
+	if (!trace_want(&trace_packet) && !trace_want(&trace_pack))
+		return;
+
+	if (in_pack) {
+		if (packet_trace_pack(buf, len, sideband))
+			return;
+	} else if (starts_with(buf, "PACK") || starts_with(buf, "\1PACK")) {
+		in_pack = 1;
+		sideband = *buf == '\1';
+		packet_trace_pack(buf, len, sideband);
+
+		/*
+		 * Make a note in the human-readable trace that the pack data
+		 * started.
+		 */
+		buf = "PACK ...";
+		len = strlen(buf);
+	}
+
+	if (!trace_want(&trace_packet))
 		return;
 
 	/* +32 is just a guess for header + quoting */
 	strbuf_init(&out, len+32);
 
 	strbuf_addf(&out, "packet: %12s%c ",
-		    packet_trace_prefix, write ? '>' : '<');
+		    get_trace_prefix(), write ? '>' : '<');
 
-	if ((len >= 4 && starts_with(buf, "PACK")) ||
-	    (len >= 5 && starts_with(buf+1, "PACK"))) {
-		strbuf_addstr(&out, "PACK ...");
-		unsetenv(trace_key);
-	}
-	else {
-		/* XXX we should really handle printable utf8 */
-		for (i = 0; i < len; i++) {
-			/* suppress newlines */
-			if (buf[i] == '\n')
-				continue;
-			if (buf[i] >= 0x20 && buf[i] <= 0x7e)
-				strbuf_addch(&out, buf[i]);
-			else
-				strbuf_addf(&out, "\\%o", buf[i]);
-		}
+	/* XXX we should really handle printable utf8 */
+	for (i = 0; i < len; i++) {
+		/* suppress newlines */
+		if (buf[i] == '\n')
+			continue;
+		if (buf[i] >= 0x20 && buf[i] <= 0x7e)
+			strbuf_addch(&out, buf[i]);
+		else
+			strbuf_addf(&out, "\\%o", buf[i]);
 	}
 
 	strbuf_addch(&out, '\n');
-	trace_strbuf(trace_key, &out);
+	trace_strbuf(&trace_packet, &out);
 	strbuf_release(&out);
 }
 
@@ -64,44 +98,45 @@ void packet_buf_flush(struct strbuf *buf)
 }
 
 #define hex(a) (hexchar[(a) & 15])
-static char buffer[1000];
-static unsigned format_packet(const char *fmt, va_list args)
+static void format_packet(struct strbuf *out, const char *fmt, va_list args)
 {
 	static char hexchar[] = "0123456789abcdef";
-	unsigned n;
+	size_t orig_len, n;
 
-	n = vsnprintf(buffer + 4, sizeof(buffer) - 4, fmt, args);
-	if (n >= sizeof(buffer)-4)
+	orig_len = out->len;
+	strbuf_addstr(out, "0000");
+	strbuf_vaddf(out, fmt, args);
+	n = out->len - orig_len;
+
+	if (n > LARGE_PACKET_MAX)
 		die("protocol error: impossibly long line");
-	n += 4;
-	buffer[0] = hex(n >> 12);
-	buffer[1] = hex(n >> 8);
-	buffer[2] = hex(n >> 4);
-	buffer[3] = hex(n);
-	packet_trace(buffer+4, n-4, 1);
-	return n;
+
+	out->buf[orig_len + 0] = hex(n >> 12);
+	out->buf[orig_len + 1] = hex(n >> 8);
+	out->buf[orig_len + 2] = hex(n >> 4);
+	out->buf[orig_len + 3] = hex(n);
+	packet_trace(out->buf + orig_len + 4, n - 4, 1);
 }
 
 void packet_write(int fd, const char *fmt, ...)
 {
+	static struct strbuf buf = STRBUF_INIT;
 	va_list args;
-	unsigned n;
 
+	strbuf_reset(&buf);
 	va_start(args, fmt);
-	n = format_packet(fmt, args);
+	format_packet(&buf, fmt, args);
 	va_end(args);
-	write_or_die(fd, buffer, n);
+	write_or_die(fd, buf.buf, buf.len);
 }
 
 void packet_buf_write(struct strbuf *buf, const char *fmt, ...)
 {
 	va_list args;
-	unsigned n;
 
 	va_start(args, fmt);
-	n = format_packet(fmt, args);
+	format_packet(buf, fmt, args);
 	va_end(args);
-	strbuf_add(buf, buffer, n);
 }
 
 static int get_packet_data(int fd, char **src_buf, size_t *src_size,

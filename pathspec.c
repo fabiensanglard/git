@@ -338,7 +338,7 @@ static void NORETURN unsupported_magic(const char *pattern,
 		if (!(magic & m->bit))
 			continue;
 		if (sb.len)
-			strbuf_addstr(&sb, " ");
+			strbuf_addch(&sb, ' ');
 		if (short_magic & m->bit)
 			strbuf_addf(&sb, "'%c'", m->mnemonic);
 		else
@@ -389,8 +389,7 @@ void parse_pathspec(struct pathspec *pathspec,
 		if (!(flags & PATHSPEC_PREFER_CWD))
 			die("BUG: PATHSPEC_PREFER_CWD requires arguments");
 
-		pathspec->items = item = xmalloc(sizeof(*item));
-		memset(item, 0, sizeof(*item));
+		pathspec->items = item = xcalloc(1, sizeof(*item));
 		item->match = prefix;
 		item->original = prefix;
 		item->nowildcard_len = item->len = strlen(prefix);
@@ -407,7 +406,8 @@ void parse_pathspec(struct pathspec *pathspec,
 		n++;
 
 	pathspec->nr = n;
-	pathspec->items = item = xmalloc(sizeof(*item) * n);
+	ALLOC_ARRAY(pathspec->items, n);
+	item = pathspec->items;
 	pathspec->_raw = argv;
 	prefixlen = prefix ? strlen(prefix) : 0;
 
@@ -484,7 +484,7 @@ const char **get_pathspec(const char *prefix, const char **pathspec)
 void copy_pathspec(struct pathspec *dst, const struct pathspec *src)
 {
 	*dst = *src;
-	dst->items = xmalloc(sizeof(struct pathspec_item) * dst->nr);
+	ALLOC_ARRAY(dst->items, dst->nr);
 	memcpy(dst->items, src->items,
 	       sizeof(struct pathspec_item) * dst->nr);
 }

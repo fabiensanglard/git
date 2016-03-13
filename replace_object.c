@@ -41,12 +41,8 @@ static int register_replace_object(struct replace_object *replace,
 		return 1;
 	}
 	pos = -pos - 1;
-	if (replace_object_alloc <= ++replace_object_nr) {
-		replace_object_alloc = alloc_nr(replace_object_alloc);
-		replace_object = xrealloc(replace_object,
-					  sizeof(*replace_object) *
-					  replace_object_alloc);
-	}
+	ALLOC_GROW(replace_object, replace_object_nr + 1, replace_object_alloc);
+	replace_object_nr++;
 	if (pos < replace_object_nr)
 		memmove(replace_object + pos + 1,
 			replace_object + pos,
@@ -57,7 +53,7 @@ static int register_replace_object(struct replace_object *replace,
 }
 
 static int register_replace_ref(const char *refname,
-				const unsigned char *sha1,
+				const struct object_id *oid,
 				int flag, void *cb_data)
 {
 	/* Get sha1 from refname */
@@ -72,7 +68,7 @@ static int register_replace_ref(const char *refname,
 	}
 
 	/* Copy sha1 from the read ref */
-	hashcpy(repl_obj->replacement, sha1);
+	hashcpy(repl_obj->replacement, oid->hash);
 
 	/* Register new object */
 	if (register_replace_object(repl_obj, 1))

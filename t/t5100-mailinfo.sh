@@ -9,9 +9,9 @@ test_description='git mailinfo and git mailsplit test'
 
 test_expect_success 'split sample box' \
 	'git mailsplit -o. "$TEST_DIRECTORY"/t5100/sample.mbox >last &&
-	last=`cat last` &&
+	last=$(cat last) &&
 	echo total is $last &&
-	test `cat last` = 17'
+	test $(cat last) = 17'
 
 check_mailinfo () {
 	mail=$1 opt=$2
@@ -23,7 +23,7 @@ check_mailinfo () {
 }
 
 
-for mail in `echo 00*`
+for mail in 00*
 do
 	test_expect_success "mailinfo $mail" '
 		check_mailinfo $mail "" &&
@@ -34,6 +34,10 @@ do
 		if test -f "$TEST_DIRECTORY"/t5100/msg$mail--no-inbody-headers
 		then
 			check_mailinfo $mail --no-inbody-headers
+		fi &&
+		if test -f "$TEST_DIRECTORY"/t5100/msg$mail--message-id
+		then
+			check_mailinfo $mail --message-id
 		fi
 	'
 done
@@ -43,11 +47,11 @@ test_expect_success 'split box with rfc2047 samples' \
 	'mkdir rfc2047 &&
 	git mailsplit -orfc2047 "$TEST_DIRECTORY"/t5100/rfc2047-samples.mbox \
 	  >rfc2047/last &&
-	last=`cat rfc2047/last` &&
+	last=$(cat rfc2047/last) &&
 	echo total is $last &&
-	test `cat rfc2047/last` = 11'
+	test $(cat rfc2047/last) = 11'
 
-for mail in `echo rfc2047/00*`
+for mail in rfc2047/00*
 do
 	test_expect_success "mailinfo $mail" '
 		git mailinfo -u $mail-msg $mail-patch <$mail >$mail-info &&
@@ -87,6 +91,24 @@ test_expect_success 'mailinfo on from header without name works' '
 	  <info-from/0001 >info-from/out &&
 	test_cmp "$TEST_DIRECTORY"/t5100/info-from.expect info-from/out
 
+'
+
+test_expect_success 'mailinfo finds headers after embedded From line' '
+	mkdir embed-from &&
+	git mailsplit -oembed-from "$TEST_DIRECTORY"/t5100/embed-from.in &&
+	test_cmp "$TEST_DIRECTORY"/t5100/embed-from.in embed-from/0001 &&
+	git mailinfo embed-from/msg embed-from/patch \
+	  <embed-from/0001 >embed-from/out &&
+	test_cmp "$TEST_DIRECTORY"/t5100/embed-from.expect embed-from/out
+'
+
+test_expect_success 'mailinfo on message with quoted >From' '
+	mkdir quoted-from &&
+	git mailsplit -oquoted-from "$TEST_DIRECTORY"/t5100/quoted-from.in &&
+	test_cmp "$TEST_DIRECTORY"/t5100/quoted-from.in quoted-from/0001 &&
+	git mailinfo quoted-from/msg quoted-from/patch \
+	  <quoted-from/0001 >quoted-from/out &&
+	test_cmp "$TEST_DIRECTORY"/t5100/quoted-from.expect quoted-from/msg
 '
 
 test_done

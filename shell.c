@@ -46,11 +46,7 @@ static int is_valid_cmd_name(const char *cmd)
 
 static char *make_cmd(const char *prog)
 {
-	char *prefix = xmalloc((strlen(prog) + strlen(COMMAND_DIR) + 2));
-	strcpy(prefix, COMMAND_DIR);
-	strcat(prefix, "/");
-	strcat(prefix, prog);
-	return prefix;
+	return xstrfmt("%s/%s", COMMAND_DIR, prog);
 }
 
 static void cd_to_homedir(void)
@@ -92,7 +88,7 @@ static void run_shell(void)
 		int count;
 
 		fprintf(stderr, "git> ");
-		if (strbuf_getline(&line, stdin, '\n') == EOF) {
+		if (strbuf_getline_lf(&line, stdin) == EOF) {
 			fprintf(stderr, "\n");
 			strbuf_release(&line);
 			break;

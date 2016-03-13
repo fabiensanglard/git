@@ -25,7 +25,7 @@ static void add_merge_entry(struct merge_list *entry)
 	merge_result_end = &entry->next;
 }
 
-static void merge_trees_recursive(struct tree_desc t[3], const char *base, int df_conflict);
+static void merge_trees(struct tree_desc t[3], const char *base);
 
 static const char *explanation(struct merge_list *entry)
 {
@@ -60,7 +60,7 @@ static void *result(struct merge_list *entry, unsigned long *size)
 	const char *path = entry->path;
 
 	if (!entry->stage)
-		return read_sha1_file(entry->blob->object.sha1, &type, size);
+		return read_sha1_file(entry->blob->object.oid.hash, &type, size);
 	base = NULL;
 	if (entry->stage == 1) {
 		base = entry->blob;
@@ -82,7 +82,7 @@ static void *origin(struct merge_list *entry, unsigned long *size)
 	enum object_type type;
 	while (entry) {
 		if (entry->stage == 2)
-			return read_sha1_file(entry->blob->object.sha1, &type, size);
+			return read_sha1_file(entry->blob->object.oid.hash, &type, size);
 		entry = entry->link;
 	}
 	return NULL;
@@ -118,7 +118,8 @@ static void show_diff(struct merge_list *entry)
 	if (!dst.ptr)
 		size = 0;
 	dst.size = size;
-	xdi_diff(&src, &dst, &xpp, &xecfg, &ecb);
+	if (xdi_diff(&src, &dst, &xpp, &xecfg, &ecb))
+		die("unable to generate diff");
 	free(src.ptr);
 	free(dst.ptr);
 }
@@ -129,7 +130,7 @@ static void show_result_list(struct merge_list *entry)
 	do {
 		struct merge_list *link = entry->link;
 		static const char *desc[4] = { "result", "base", "our", "their" };
-		printf("  %-6s %o %s %s\n", desc[entry->stage], entry->mode, sha1_to_hex(entry->blob->object.sha1), entry->path);
+		printf("  %-6s %o %s %s\n", desc[entry->stage], entry->mode, oid_to_hex(&entry->blob->object.oid), entry->path);
 		entry = link;
 	} while (entry);
 }
@@ -173,7 +174,7 @@ static struct merge_list *create_entry(unsigned stage, unsigned mode, const unsi
 
 static char *traverse_path(const struct traverse_info *info, const struct name_entry *n)
 {
-	char *path = xmalloc(traverse_path_len(info, n) + 1);
+	char *path = xmallocz(traverse_path_len(info, n));
 	return make_traverse_path(path, info, n);
 }
 
@@ -195,8 +196,8 @@ static void resolve(const struct traverse_info *info, struct name_entry *ours, s
 	add_merge_entry(final);
 }
 
-static void unresolved_directory(const struct traverse_info *info, struct name_entry n[3],
-				 int df_conflict)
+static void unresolved_directory(const struct traverse_info *info,
+				 struct name_entry n[3])
 {
 	char *newbase;
 	struct name_entry *p;
@@ -218,7 +219,7 @@ static void unresolved_directory(const struct traverse_info *info, struct name_e
 	buf2 = fill_tree_descriptor(t+2, ENTRY_SHA1(n + 2));
 #undef ENTRY_SHA1
 
-	merge_trees_recursive(t, newbase, df_conflict);
+	merge_trees(t, newbase);
 
 	free(buf0);
 	free(buf1);
@@ -259,7 +260,7 @@ static void unresolved(const struct traverse_info *info, struct name_entry n[3])
 			dirmask |= (1 << i);
 	}
 
-	unresolved_directory(info, n, dirmask && (dirmask != mask));
+	unresolved_directory(info, n);
 
 	if (dirmask == mask)
 		return;
@@ -335,19 +336,13 @@ static int threeway_callback(int n, unsigned long mask, unsigned long dirmask, s
 	return mask;
 }
 
-static void merge_trees_recursive(struct tree_desc t[3], const char *base, int df_conflict)
+static void merge_trees(struct tree_desc t[3], const char *base)
 {
 	struct traverse_info info;
 
 	setup_traverse_info(&info, base);
-	info.data = &df_conflict;
 	info.fn = threeway_callback;
 	traverse_trees(3, t, &info);
-}
-
-static void merge_trees(struct tree_desc t[3], const char *base)
-{
-	merge_trees_recursive(t, base, 0);
 }
 
 static void *get_tree_descriptor(struct tree_desc *desc, const char *rev)

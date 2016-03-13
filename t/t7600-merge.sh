@@ -57,11 +57,10 @@ create_merge_msgs () {
 		git log --no-merges ^HEAD c2 c3
 	} >squash.1-5-9 &&
 	: >msg.nologff &&
-	echo >msg.nolognoff &&
+	: >msg.nolognoff &&
 	{
 		echo "* tag 'c3':" &&
-		echo "  commit 3" &&
-		echo
+		echo "  commit 3"
 	} >msg.log
 }
 
@@ -71,7 +70,7 @@ verify_merge () {
 	git diff --exit-code &&
 	if test -n "$3"
 	then
-		git show -s --pretty=format:%s HEAD >msg.act &&
+		git show -s --pretty=tformat:%s HEAD >msg.act &&
 		test_cmp "$3" msg.act
 	fi
 }
@@ -134,7 +133,7 @@ test_expect_success 'setup' '
 	test_tick &&
 	git commit -m "commit 3" &&
 	git tag c3 &&
-	c3=$(git rev-parse HEAD)
+	c3=$(git rev-parse HEAD) &&
 	git reset --hard "$c0" &&
 	create_merge_msgs
 '
@@ -620,10 +619,10 @@ test_expect_success 'merge early part of c2' '
 	git tag c6 &&
 	git branch -f c5-branch c5 &&
 	git merge c5-branch~1 &&
-	git show -s --pretty=format:%s HEAD >actual.branch &&
+	git show -s --pretty=tformat:%s HEAD >actual.branch &&
 	git reset --keep HEAD^ &&
 	git merge c5~1 &&
-	git show -s --pretty=format:%s HEAD >actual.tag &&
+	git show -s --pretty=tformat:%s HEAD >actual.tag &&
 	test_cmp expected.branch actual.branch &&
 	test_cmp expected.tag actual.tag
 '
@@ -691,6 +690,39 @@ test_expect_success GPG 'merge --no-edit tag should skip editor' '
 	git rev-parse signed^0 >expect &&
 	git rev-parse HEAD^2 >actual &&
 	test_cmp actual expect
+'
+
+test_expect_success 'set up mod-256 conflict scenario' '
+	# 256 near-identical stanzas...
+	for i in $(test_seq 1 256); do
+		for j in 1 2 3 4 5; do
+			echo $i-$j
+		done
+	done >file &&
+	git add file &&
+	git commit -m base &&
+
+	# one side changes the first line of each to "master"
+	sed s/-1/-master/ <file >tmp &&
+	mv tmp file &&
+	git commit -am master &&
+
+	# and the other to "side"; merging the two will
+	# yield 256 separate conflicts
+	git checkout -b side HEAD^ &&
+	sed s/-1/-side/ <file >tmp &&
+	mv tmp file &&
+	git commit -am side
+'
+
+test_expect_success 'merge detects mod-256 conflicts (recursive)' '
+	git reset --hard &&
+	test_must_fail git merge -s recursive master
+'
+
+test_expect_success 'merge detects mod-256 conflicts (resolve)' '
+	git reset --hard &&
+	test_must_fail git merge -s resolve master
 '
 
 test_done

@@ -5,7 +5,7 @@ test_description=check-ignore
 . ./test-lib.sh
 
 init_vars () {
-	global_excludes="$(pwd)/global-excludes"
+	global_excludes="global-excludes"
 }
 
 enable_global_excludes () {
@@ -804,6 +804,41 @@ test_expect_success !MINGW 'quoting allows trailing whitespace' '
 	git ls-files -o -X ignore whitespace >actual 2>err &&
 	test_cmp expect actual &&
 	test_cmp err.expect err
+'
+
+test_expect_success !MINGW,!CYGWIN 'correct handling of backslashes' '
+	rm -rf whitespace &&
+	mkdir whitespace &&
+	>"whitespace/trailing 1  " &&
+	>"whitespace/trailing 2 \\\\" &&
+	>"whitespace/trailing 3 \\\\" &&
+	>"whitespace/trailing 4   \\ " &&
+	>"whitespace/trailing 5 \\ \\ " &&
+	>"whitespace/trailing 6 \\a\\" &&
+	>whitespace/untracked &&
+	sed -e "s/Z$//" >ignore <<-\EOF &&
+	whitespace/trailing 1 \    Z
+	whitespace/trailing 2 \\\\Z
+	whitespace/trailing 3 \\\\ Z
+	whitespace/trailing 4   \\\    Z
+	whitespace/trailing 5 \\ \\\   Z
+	whitespace/trailing 6 \\a\\Z
+	EOF
+	echo whitespace/untracked >expect &&
+	>err.expect &&
+	git ls-files -o -X ignore whitespace >actual 2>err &&
+	test_cmp expect actual &&
+	test_cmp err.expect err
+'
+
+test_expect_success 'info/exclude trumps core.excludesfile' '
+	echo >>global-excludes usually-ignored &&
+	echo >>.git/info/exclude "!usually-ignored" &&
+	>usually-ignored &&
+	echo "?? usually-ignored" >expect &&
+
+	git status --porcelain usually-ignored >actual &&
+	test_cmp expect actual
 '
 
 test_done

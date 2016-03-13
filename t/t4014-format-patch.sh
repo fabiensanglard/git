@@ -43,7 +43,7 @@ test_expect_success setup '
 test_expect_success "format-patch --ignore-if-in-upstream" '
 
 	git format-patch --stdout master..side >patch0 &&
-	cnt=`grep "^From " patch0 | wc -l` &&
+	cnt=$(grep "^From " patch0 | wc -l) &&
 	test $cnt = 3
 
 '
@@ -52,9 +52,17 @@ test_expect_success "format-patch --ignore-if-in-upstream" '
 
 	git format-patch --stdout \
 		--ignore-if-in-upstream master..side >patch1 &&
-	cnt=`grep "^From " patch1 | wc -l` &&
+	cnt=$(grep "^From " patch1 | wc -l) &&
 	test $cnt = 2
 
+'
+
+test_expect_success "format-patch --ignore-if-in-upstream handles tags" '
+	git tag -a v1 -m tag side &&
+	git tag -a v2 -m tag master &&
+	git format-patch --stdout --ignore-if-in-upstream v2..v1 >patch1 &&
+	cnt=$(grep "^From " patch1 | wc -l) &&
+	test $cnt = 2
 '
 
 test_expect_success "format-patch doesn't consider merge commits" '
@@ -69,7 +77,7 @@ test_expect_success "format-patch doesn't consider merge commits" '
 	git checkout -b merger master &&
 	test_tick &&
 	git merge --no-ff slave &&
-	cnt=`git format-patch -3 --stdout | grep "^From " | wc -l` &&
+	cnt=$(git format-patch -3 --stdout | grep "^From " | wc -l) &&
 	test $cnt = 3
 '
 
@@ -77,7 +85,7 @@ test_expect_success "format-patch result applies" '
 
 	git checkout -b rebuild-0 master &&
 	git am -3 patch0 &&
-	cnt=`git rev-list master.. | wc -l` &&
+	cnt=$(git rev-list master.. | wc -l) &&
 	test $cnt = 2
 '
 
@@ -85,7 +93,7 @@ test_expect_success "format-patch --ignore-if-in-upstream result applies" '
 
 	git checkout -b rebuild-1 master &&
 	git am -3 patch1 &&
-	cnt=`git rev-list master.. | wc -l` &&
+	cnt=$(git rev-list master.. | wc -l) &&
 	test $cnt = 2
 '
 
@@ -762,24 +770,77 @@ test_expect_success 'format-patch --signature="" suppresses signatures' '
 	! grep "^-- \$" output
 '
 
+test_expect_success 'prepare mail-signature input' '
+	cat >mail-signature <<-\EOF
+
+	Test User <test.email@kernel.org>
+	http://git.kernel.org/cgit/git/git.git
+
+	git.kernel.org/?p=git/git.git;a=summary
+
+	EOF
+'
+
+test_expect_success '--signature-file=file works' '
+	git format-patch --stdout --signature-file=mail-signature -1 >output &&
+	check_patch output &&
+	sed -e "1,/^-- \$/d" <output >actual &&
+	{
+		cat mail-signature && echo
+	} >expect &&
+	test_cmp expect actual
+'
+
+test_expect_success 'format.signaturefile works' '
+	test_config format.signaturefile mail-signature &&
+	git format-patch --stdout -1 >output &&
+	check_patch output &&
+	sed -e "1,/^-- \$/d" <output >actual &&
+	{
+		cat mail-signature && echo
+	} >expect &&
+	test_cmp expect actual
+'
+
+test_expect_success '--no-signature suppresses format.signaturefile ' '
+	test_config format.signaturefile mail-signature &&
+	git format-patch --stdout --no-signature -1 >output &&
+	check_patch output &&
+	! grep "^-- \$" output
+'
+
+test_expect_success '--signature-file overrides format.signaturefile' '
+	cat >other-mail-signature <<-\EOF &&
+	Use this other signature instead of mail-signature.
+	EOF
+	test_config format.signaturefile mail-signature &&
+	git format-patch --stdout \
+			--signature-file=other-mail-signature -1 >output &&
+	check_patch output &&
+	sed -e "1,/^-- \$/d" <output >actual &&
+	{
+		cat other-mail-signature && echo
+	} >expect &&
+	test_cmp expect actual
+'
+
+test_expect_success '--signature overrides format.signaturefile' '
+	test_config format.signaturefile mail-signature &&
+	git format-patch --stdout --signature="my sig" -1 >output &&
+	check_patch output &&
+	grep "my sig" output
+'
+
 test_expect_success TTY 'format-patch --stdout paginates' '
 	rm -f pager_used &&
-	(
-		GIT_PAGER="wc >pager_used" &&
-		export GIT_PAGER &&
-		test_terminal git format-patch --stdout --all
-	) &&
+	test_terminal env GIT_PAGER="wc >pager_used" git format-patch --stdout --all &&
 	test_path_is_file pager_used
 '
 
  test_expect_success TTY 'format-patch --stdout pagination can be disabled' '
 	rm -f pager_used &&
-	(
-		GIT_PAGER="wc >pager_used" &&
-		export GIT_PAGER &&
-		test_terminal git --no-pager format-patch --stdout --all &&
-		test_terminal git -c "pager.format-patch=false" format-patch --stdout --all
-	) &&
+	test_terminal env GIT_PAGER="wc >pager_used" git --no-pager format-patch --stdout --all &&
+	test_terminal env GIT_PAGER="wc >pager_used" git -c "pager.format-patch=false" format-patch --stdout --all &&
 	test_path_is_missing pager_used &&
 	test_path_is_missing .git/pager_used
 '
@@ -1368,6 +1429,35 @@ test_expect_success 'cover letter auto user override' '
 	test_line_count = 1 list &&
 	git format-patch -o tmp --no-cover-letter -2 >list &&
 	test_line_count = 2 list
+'
+
+test_expect_success 'format-patch --zero-commit' '
+	git format-patch --zero-commit --stdout v2..v1 >patch2 &&
+	grep "^From " patch2 | sort | uniq >actual &&
+	echo "From $_z40 Mon Sep 17 00:00:00 2001" >expect &&
+	test_cmp expect actual
+'
+
+test_expect_success 'From line has expected format' '
+	git format-patch --stdout v2..v1 >patch2 &&
+	grep "^From " patch2 >from &&
+	grep "^From $_x40 Mon Sep 17 00:00:00 2001$" patch2 >filtered &&
+	test_cmp from filtered
+'
+
+test_expect_success 'format-patch format.outputDirectory option' '
+	test_config format.outputDirectory patches &&
+	rm -fr patches &&
+	git format-patch master..side &&
+	test $(git rev-list master..side | wc -l) -eq $(ls patches | wc -l)
+'
+
+test_expect_success 'format-patch -o overrides format.outputDirectory' '
+	test_config format.outputDirectory patches &&
+	rm -fr patches patchset &&
+	git format-patch master..side -o patchset &&
+	test_path_is_missing patches &&
+	test_path_is_dir patchset
 '
 
 test_done

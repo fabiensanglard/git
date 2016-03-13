@@ -22,14 +22,10 @@ static int stdin_diff_commit(struct commit *commit, char *line, int len)
 	if (isspace(line[40]) && !get_sha1_hex(line+41, sha1)) {
 		/* Graft the fake parents locally to the commit */
 		int pos = 41;
-		struct commit_list **pptr, *parents;
+		struct commit_list **pptr;
 
 		/* Free the real parent list */
-		for (parents = commit->parents; parents; ) {
-			struct commit_list *tmp = parents->next;
-			free(parents);
-			parents = tmp;
-		}
+		free_commit_list(commit->parents);
 		commit->parents = NULL;
 		pptr = &(commit->parents);
 		while (line[pos] && !get_sha1_hex(line + pos, sha1)) {
@@ -53,9 +49,9 @@ static int stdin_diff_trees(struct tree *tree1, char *line, int len)
 	tree2 = lookup_tree(sha1);
 	if (!tree2 || parse_tree(tree2))
 		return -1;
-	printf("%s %s\n", sha1_to_hex(tree1->object.sha1),
-			  sha1_to_hex(tree2->object.sha1));
-	diff_tree_sha1(tree1->object.sha1, tree2->object.sha1,
+	printf("%s %s\n", oid_to_hex(&tree1->object.oid),
+			  oid_to_hex(&tree2->object.oid));
+	diff_tree_sha1(tree1->object.oid.hash, tree2->object.oid.hash,
 		       "", &log_tree_opt.diffopt);
 	log_tree_diff_flush(&log_tree_opt);
 	return 0;
@@ -72,9 +68,7 @@ static int diff_tree_stdin(char *line)
 	line[len-1] = 0;
 	if (get_sha1_hex(line, sha1))
 		return -1;
-	obj = lookup_unknown_object(sha1);
-	if (!obj || !obj->parsed)
-		obj = parse_object(sha1);
+	obj = parse_object(sha1);
 	if (!obj)
 		return -1;
 	if (obj->type == OBJ_COMMIT)
@@ -88,7 +82,7 @@ static int diff_tree_stdin(char *line)
 
 static const char diff_tree_usage[] =
 "git diff-tree [--stdin] [-m] [-c] [--cc] [-s] [-v] [--pretty] [-t] [-r] [--root] "
-"[<common diff options>] <tree-ish> [<tree-ish>] [<path>...]\n"
+"[<common-diff-options>] <tree-ish> [<tree-ish>] [<path>...]\n"
 "  -r            diff recursively\n"
 "  --root        include the initial commit as diff against /dev/null\n"
 COMMON_DIFF_OPTIONS_HELP;
@@ -145,7 +139,7 @@ int cmd_diff_tree(int argc, const char **argv, const char *prefix)
 		break;
 	case 1:
 		tree1 = opt->pending.objects[0].item;
-		diff_tree_commit_sha1(tree1->sha1);
+		diff_tree_commit_sha1(tree1->oid.hash);
 		break;
 	case 2:
 		tree1 = opt->pending.objects[0].item;
@@ -155,8 +149,8 @@ int cmd_diff_tree(int argc, const char **argv, const char *prefix)
 			tree2 = tree1;
 			tree1 = tmp;
 		}
-		diff_tree_sha1(tree1->sha1,
-			       tree2->sha1,
+		diff_tree_sha1(tree1->oid.hash,
+			       tree2->oid.hash,
 			       "", &opt->diffopt);
 		log_tree_diff_flush(opt);
 		break;

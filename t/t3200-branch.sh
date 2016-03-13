@@ -59,7 +59,7 @@ test_expect_success 'git branch -l d/e/f should create a branch and a log' '
 test_expect_success 'git branch -d d/e/f should delete a branch and a log' '
 	git branch -d d/e/f &&
 	test_path_is_missing .git/refs/heads/d/e/f &&
-	test_path_is_missing .git/logs/refs/heads/d/e/f
+	test_must_fail git reflog exists refs/heads/d/e/f
 '
 
 test_expect_success 'git branch j/k should work after branch j has been deleted' '
@@ -82,19 +82,33 @@ test_expect_success 'git branch -m dumps usage' '
 test_expect_success 'git branch -m m m/m should work' '
 	git branch -l m &&
 	git branch -m m m/m &&
-	test_path_is_file .git/logs/refs/heads/m/m
+	git reflog exists refs/heads/m/m
 '
 
 test_expect_success 'git branch -m n/n n should work' '
 	git branch -l n/n &&
 	git branch -m n/n n &&
-	test_path_is_file .git/logs/refs/heads/n
+	git reflog exists refs/heads/n
 '
 
 test_expect_success 'git branch -m o/o o should fail when o/p exists' '
 	git branch o/o &&
 	git branch o/p &&
 	test_must_fail git branch -m o/o o
+'
+
+test_expect_success 'git branch -m o/q o/p should fail when o/p exists' '
+	git branch o/q &&
+	test_must_fail git branch -m o/q o/p
+'
+
+test_expect_success 'git branch -M o/q o/p should work when o/p exists' '
+	git branch -M o/q o/p
+'
+
+test_expect_success 'git branch -m -f o/q o/p should work when o/p exists' '
+	git branch o/q &&
+	git branch -m -f o/q o/p
 '
 
 test_expect_success 'git branch -m q r/q should fail when r exists' '
@@ -253,12 +267,12 @@ git config branch.s/s.dummy Hello
 
 test_expect_success 'git branch -m s/s s should work when s/t is deleted' '
 	git branch -l s/s &&
-	test_path_is_file .git/logs/refs/heads/s/s &&
+	git reflog exists refs/heads/s/s &&
 	git branch -l s/t &&
-	test_path_is_file .git/logs/refs/heads/s/t &&
+	git reflog exists refs/heads/s/t &&
 	git branch -d s/t &&
 	git branch -m s/s s &&
-	test_path_is_file .git/logs/refs/heads/s
+	git reflog exists refs/heads/s
 '
 
 test_expect_success 'config information was renamed, too' '
@@ -282,6 +296,15 @@ test_expect_success 'deleting a dangling symref' '
 	echo "Deleted branch dangling-symref (was nowhere)." >expect &&
 	git branch -d dangling-symref >actual &&
 	test_path_is_missing .git/refs/heads/dangling-symref &&
+	test_i18ncmp expect actual
+'
+
+test_expect_success 'deleting a self-referential symref' '
+	git symbolic-ref refs/heads/self-reference refs/heads/self-reference &&
+	test_path_is_file .git/refs/heads/self-reference &&
+	echo "Deleted branch self-reference (was refs/heads/self-reference)." >expect &&
+	git branch -d self-reference >actual &&
+	test_path_is_missing .git/refs/heads/self-reference &&
 	test_i18ncmp expect actual
 '
 
@@ -423,6 +446,13 @@ test_expect_success '--set-upstream-to fails on a non-ref' '
 	test_must_fail git branch --set-upstream-to HEAD^{}
 '
 
+test_expect_success '--set-upstream-to fails on locked config' '
+	test_when_finished "rm -f .git/config.lock" &&
+	>.git/config.lock &&
+	git branch locked &&
+	test_must_fail git branch --set-upstream-to locked
+'
+
 test_expect_success 'use --set-upstream-to modify HEAD' '
 	test_config branch.master.remote foo &&
 	test_config branch.master.merge foo &&
@@ -441,6 +471,13 @@ test_expect_success 'use --set-upstream-to modify a particular branch' '
 
 test_expect_success '--unset-upstream should fail if given a non-existent branch' '
 	test_must_fail git branch --unset-upstream i-dont-exist
+'
+
+test_expect_success '--unset-upstream should fail if config is locked' '
+	test_when_finished "rm -f .git/config.lock" &&
+	git branch --set-upstream-to locked &&
+	>.git/config.lock &&
+	test_must_fail git branch --unset-upstream
 '
 
 test_expect_success 'test --unset-upstream on HEAD' '
@@ -507,6 +544,16 @@ EOF
 	test_cmp expected actual
 '
 
+test_expect_success '--set-upstream-to notices an error to set branch as own upstream' '
+	git branch --set-upstream-to refs/heads/my13 my13 2>actual &&
+	cat >expected <<-\EOF &&
+	warning: Not setting branch my13 as its own upstream.
+	EOF
+	test_expect_code 1 git config branch.my13.remote &&
+	test_expect_code 1 git config branch.my13.merge &&
+	test_i18ncmp expected actual
+'
+
 # Keep this test last, as it changes the current branch
 cat >expect <<EOF
 $_z40 $HEAD $GIT_COMMITTER_NAME <$GIT_COMMITTER_EMAIL> 1117150200 +0000	branch: Created from master
@@ -546,7 +593,7 @@ test_expect_success 'avoid ambiguous track' '
 	git config remote.ambi1.fetch refs/heads/lalala:refs/heads/master &&
 	git config remote.ambi2.url lilili &&
 	git config remote.ambi2.fetch refs/heads/lilili:refs/heads/master &&
-	git branch all1 master &&
+	test_must_fail git branch all1 master &&
 	test -z "$(git config branch.all1.merge)"
 '
 
@@ -849,11 +896,7 @@ test_expect_success 'detect typo in branch name when using --edit-description' '
 	write_script editor <<-\EOF &&
 		echo "New contents" >"$1"
 	EOF
-	(
-		EDITOR=./editor &&
-		export EDITOR &&
-		test_must_fail git branch --edit-description no-such-branch
-	)
+	test_must_fail env EDITOR=./editor git branch --edit-description no-such-branch
 '
 
 test_expect_success 'refuse --edit-description on unborn branch for now' '
@@ -861,11 +904,7 @@ test_expect_success 'refuse --edit-description on unborn branch for now' '
 		echo "New contents" >"$1"
 	EOF
 	git checkout --orphan unborn &&
-	(
-		EDITOR=./editor &&
-		export EDITOR &&
-		test_must_fail git branch --edit-description
-	)
+	test_must_fail env EDITOR=./editor git branch --edit-description
 '
 
 test_expect_success '--merged catches invalid object names' '

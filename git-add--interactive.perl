@@ -515,6 +515,9 @@ sub error_msg {
 sub list_and_choose {
 	my ($opts, @stuff) = @_;
 	my (@chosen, @return);
+	if (!@stuff) {
+	    return @return;
+	}
 	my $i;
 	my @prefixes = find_unique_prefixes(@stuff) unless $opts->{LIST_ONLY};
 
@@ -725,6 +728,8 @@ sub add_untracked_cmd {
 	if (@add) {
 		system(qw(git update-index --add --), @add);
 		say_n_paths('added', @add);
+	} else {
+		print "No untracked files.\n";
 	}
 	print "\n";
 }
@@ -1159,9 +1164,9 @@ sub help_patch_cmd {
 	print colored $help_color, <<EOF ;
 y - $verb this hunk$target
 n - do not $verb this hunk$target
-q - quit; do not $verb this hunk nor any of the remaining ones
+q - quit; do not $verb this hunk or any of the remaining ones
 a - $verb this hunk and all later hunks in the file
-d - do not $verb this hunk nor any of the later hunks in the file
+d - do not $verb this hunk or any of the later hunks in the file
 g - select a hunk to go to
 / - search for a hunk matching the given regex
 j - leave this hunk undecided, see next undecided hunk
@@ -1356,6 +1361,7 @@ sub patch_update_file {
 		  $patch_mode_flavour{TARGET},
 		  " [y,n,q,a,d,/$other,?]? ";
 		my $line = prompt_single_character;
+		last unless defined $line;
 		if ($line) {
 			if ($line =~ /^y/i) {
 				$hunk[$ix]{USE} = 1;

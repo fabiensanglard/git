@@ -29,7 +29,7 @@ struct object_request {
 struct alternates_request {
 	struct walker *walker;
 	const char *base;
-	char *url;
+	struct strbuf *url;
 	struct strbuf *buffer;
 	struct active_request_slot *slot;
 	int http_specific;
@@ -195,10 +195,11 @@ static void process_alternates_response(void *callback_data)
 
 			/* Try reusing the slot to get non-http alternates */
 			alt_req->http_specific = 0;
-			sprintf(alt_req->url, "%s/objects/info/alternates",
-				base);
+			strbuf_reset(alt_req->url);
+			strbuf_addf(alt_req->url, "%s/objects/info/alternates",
+				    base);
 			curl_easy_setopt(slot->curl, CURLOPT_URL,
-					 alt_req->url);
+					 alt_req->url->buf);
 			active_requests++;
 			slot->in_use = 1;
 			if (slot->finished != NULL)
@@ -230,7 +231,6 @@ static void process_alternates_response(void *callback_data)
 			int okay = 0;
 			int serverlen = 0;
 			struct alt_base *newalt;
-			char *target = NULL;
 			if (data[i] == '/') {
 				/*
 				 * This counts
@@ -287,17 +287,15 @@ static void process_alternates_response(void *callback_data)
 			}
 			/* skip "objects\n" at end */
 			if (okay) {
-				target = xmalloc(serverlen + posn - i - 6);
-				memcpy(target, base, serverlen);
-				memcpy(target + serverlen, data + i,
-				       posn - i - 7);
-				target[serverlen + posn - i - 7] = 0;
+				struct strbuf target = STRBUF_INIT;
+				strbuf_add(&target, base, serverlen);
+				strbuf_add(&target, data + i, posn - i - 7);
 				if (walker->get_verbosely)
-					fprintf(stderr,
-						"Also look at %s\n", target);
+					fprintf(stderr, "Also look at %s\n",
+						target.buf);
 				newalt = xmalloc(sizeof(*newalt));
 				newalt->next = NULL;
-				newalt->base = target;
+				newalt->base = strbuf_detach(&target, NULL);
 				newalt->got_indices = 0;
 				newalt->packs = NULL;
 
@@ -315,7 +313,7 @@ static void process_alternates_response(void *callback_data)
 static void fetch_alternates(struct walker *walker, const char *base)
 {
 	struct strbuf buffer = STRBUF_INIT;
-	char *url;
+	struct strbuf url = STRBUF_INIT;
 	struct active_request_slot *slot;
 	struct alternates_request alt_req;
 	struct walker_data *cdata = walker->data;
@@ -341,8 +339,7 @@ static void fetch_alternates(struct walker *walker, const char *base)
 	if (walker->get_verbosely)
 		fprintf(stderr, "Getting alternates list for %s\n", base);
 
-	url = xmalloc(strlen(base) + 31);
-	sprintf(url, "%s/objects/info/http-alternates", base);
+	strbuf_addf(&url, "%s/objects/info/http-alternates", base);
 
 	/*
 	 * Use a callback to process the result, since another request
@@ -355,10 +352,10 @@ static void fetch_alternates(struct walker *walker, const char *base)
 
 	curl_easy_setopt(slot->curl, CURLOPT_FILE, &buffer);
 	curl_easy_setopt(slot->curl, CURLOPT_WRITEFUNCTION, fwrite_buffer);
-	curl_easy_setopt(slot->curl, CURLOPT_URL, url);
+	curl_easy_setopt(slot->curl, CURLOPT_URL, url.buf);
 
 	alt_req.base = base;
-	alt_req.url = url;
+	alt_req.url = &url;
 	alt_req.buffer = &buffer;
 	alt_req.http_specific = 1;
 	alt_req.slot = slot;
@@ -369,7 +366,7 @@ static void fetch_alternates(struct walker *walker, const char *base)
 		cdata->got_alternates = -1;
 
 	strbuf_release(&buffer);
-	free(url);
+	strbuf_release(&url);
 }
 
 static int fetch_indices(struct walker *walker, struct alt_base *repo)
@@ -566,8 +563,7 @@ struct walker *get_http_walker(const char *url)
 	struct walker *walker = xmalloc(sizeof(struct walker));
 
 	data->alt = xmalloc(sizeof(*data->alt));
-	data->alt->base = xmalloc(strlen(url) + 1);
-	strcpy(data->alt->base, url);
+	data->alt->base = xstrdup(url);
 	for (s = data->alt->base + strlen(data->alt->base) - 1; *s == '/'; --s)
 		*s = 0;
 

@@ -1,22 +1,10 @@
 #include "cache.h"
+#include "tempfile.h"
 #include "credential.h"
 #include "unix-socket.h"
-#include "sigchain.h"
+#include "parse-options.h"
 
-static const char *socket_path;
-
-static void cleanup_socket(void)
-{
-	if (socket_path)
-		unlink(socket_path);
-}
-
-static void cleanup_socket_on_signal(int sig)
-{
-	cleanup_socket();
-	sigchain_pop(sig);
-	raise(sig);
-}
+static struct tempfile socket_file;
 
 struct credential_cache_entry {
 	struct credential item;
@@ -108,15 +96,13 @@ static int read_request(FILE *fh, struct credential *c,
 	static struct strbuf item = STRBUF_INIT;
 	const char *p;
 
-	strbuf_getline(&item, fh, '\n');
-	p = skip_prefix(item.buf, "action=");
-	if (!p)
+	strbuf_getline_lf(&item, fh);
+	if (!skip_prefix(item.buf, "action=", &p))
 		return error("client sent bogus action line: %s", item.buf);
 	strbuf_addstr(action, p);
 
-	strbuf_getline(&item, fh, '\n');
-	p = skip_prefix(item.buf, "timeout=");
-	if (!p)
+	strbuf_getline_lf(&item, fh);
+	if (!skip_prefix(item.buf, "timeout=", &p))
 		return error("client sent bogus timeout line: %s", item.buf);
 	*timeout = atoi(p);
 
@@ -203,7 +189,7 @@ static int serve_cache_loop(int fd)
 	return 1;
 }
 
-static void serve_cache(const char *socket_path)
+static void serve_cache(const char *socket_path, int debug)
 {
 	int fd;
 
@@ -213,12 +199,15 @@ static void serve_cache(const char *socket_path)
 
 	printf("ok\n");
 	fclose(stdout);
+	if (!debug) {
+		if (!freopen("/dev/null", "w", stderr))
+			die_errno("unable to point stderr to /dev/null");
+	}
 
 	while (serve_cache_loop(fd))
 		; /* nothing */
 
 	close(fd);
-	unlink(socket_path);
 }
 
 static const char permissions_advice[] =
@@ -226,7 +215,7 @@ static const char permissions_advice[] =
 "users may be able to read your cached credentials. Consider running:\n"
 "\n"
 "	chmod 0700 %s";
-static void check_socket_directory(const char *path)
+static void init_socket_directory(const char *path)
 {
 	struct stat st;
 	char *path_copy = xstrdup(path);
@@ -235,35 +224,64 @@ static void check_socket_directory(const char *path)
 	if (!stat(dir, &st)) {
 		if (st.st_mode & 077)
 			die(permissions_advice, dir);
-		free(path_copy);
-		return;
+	} else {
+		/*
+		 * We must be sure to create the directory with the correct mode,
+		 * not just chmod it after the fact; otherwise, there is a race
+		 * condition in which somebody can chdir to it, sleep, then try to open
+		 * our protected socket.
+		 */
+		if (safe_create_leading_directories_const(dir) < 0)
+			die_errno("unable to create directories for '%s'", dir);
+		if (mkdir(dir, 0700) < 0)
+			die_errno("unable to mkdir '%s'", dir);
 	}
 
-	/*
-	 * We must be sure to create the directory with the correct mode,
-	 * not just chmod it after the fact; otherwise, there is a race
-	 * condition in which somebody can chdir to it, sleep, then try to open
-	 * our protected socket.
-	 */
-	if (safe_create_leading_directories_const(dir) < 0)
-		die_errno("unable to create directories for '%s'", dir);
-	if (mkdir(dir, 0700) < 0)
-		die_errno("unable to mkdir '%s'", dir);
+	if (chdir(dir))
+		/*
+		 * We don't actually care what our cwd is; we chdir here just to
+		 * be a friendly daemon and avoid tying up our original cwd.
+		 * If this fails, it's OK to just continue without that benefit.
+		 */
+		;
+
 	free(path_copy);
 }
 
 int main(int argc, const char **argv)
 {
-	socket_path = argv[1];
+	const char *socket_path;
+	int ignore_sighup = 0;
+	static const char *usage[] = {
+		"git-credential-cache--daemon [opts] <socket_path>",
+		NULL
+	};
+	int debug = 0;
+	const struct option options[] = {
+		OPT_BOOL(0, "debug", &debug,
+			 N_("print debugging messages to stderr")),
+		OPT_END()
+	};
+
+	git_config_get_bool("credentialcache.ignoresighup", &ignore_sighup);
+
+	argc = parse_options(argc, argv, NULL, options, usage, 0);
+	socket_path = argv[0];
 
 	if (!socket_path)
-		die("usage: git-credential-cache--daemon <socket_path>");
-	check_socket_directory(socket_path);
+		usage_with_options(usage, options);
 
-	atexit(cleanup_socket);
-	sigchain_push_common(cleanup_socket_on_signal);
+	if (!is_absolute_path(socket_path))
+		die("socket directory must be an absolute path");
 
-	serve_cache(socket_path);
+	init_socket_directory(socket_path);
+	register_tempfile(&socket_file, socket_path);
+
+	if (ignore_sighup)
+		signal(SIGHUP, SIG_IGN);
+
+	serve_cache(socket_path, debug);
+	delete_tempfile(&socket_file);
 
 	return 0;
 }

@@ -8,6 +8,9 @@ test_perf_large_repo
 # note that we do everything through config,
 # since we want to be able to compare bitmap-aware
 # git versus non-bitmap git
+#
+# We intentionally use the deprecated pack.writebitmaps
+# config so that we can test against older versions of git.
 test_expect_success 'setup bitmap config' '
 	git config pack.writebitmaps true &&
 	git config pack.writebitmaphashcache true
@@ -36,14 +39,14 @@ test_expect_success 'create partial bitmap state' '
 
 	# now kill off all of the refs and pretend we had
 	# just the one tip
-	rm -rf .git/logs .git/refs/* .git/packed-refs
-	git update-ref HEAD $cutoff
+	rm -rf .git/logs .git/refs/* .git/packed-refs &&
+	git update-ref HEAD $cutoff &&
 
 	# and then repack, which will leave us with a nice
 	# big bitmap pack of the "old" history, and all of
 	# the new history will be loose, as if it had been pushed
 	# up incrementally and exploded via unpack-objects
-	git repack -Ad
+	git repack -Ad &&
 
 	# and now restore our original tip, as if the pushes
 	# had happened

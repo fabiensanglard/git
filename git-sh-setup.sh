@@ -81,7 +81,7 @@ if test -n "$OPTIONS_SPEC"; then
 		echo exit $?
 	)"
 else
-	dashless=$(basename "$0" | sed -e 's/-/ /')
+	dashless=$(basename -- "$0" | sed -e 's/-/ /')
 	usage() {
 		die "usage: $dashless $USAGE"
 	}
@@ -160,7 +160,7 @@ git_pager() {
 	else
 		GIT_PAGER=cat
 	fi
-	: ${LESS=-FRSX}
+	: ${LESS=-FRX}
 	: ${LV=-c}
 	export LESS LV
 
@@ -330,8 +330,7 @@ esac
 
 # Make sure we are in a valid repository of a vintage we understand,
 # if we require to be in a git repository.
-if test -z "$NONGIT_OK"
-then
+git_dir_init () {
 	GIT_DIR=$(git rev-parse --git-dir) || exit
 	if [ -z "$SUBDIRECTORY_OK" ]
 	then
@@ -345,7 +344,12 @@ then
 		echo >&2 "Unable to determine absolute path of git directory"
 		exit 1
 	}
-	: ${GIT_OBJECT_DIRECTORY="$GIT_DIR/objects"}
+	: ${GIT_OBJECT_DIRECTORY="$(git rev-parse --git-path objects)"}
+}
+
+if test -z "$NONGIT_OK"
+then
+	git_dir_init
 fi
 
 peel_committish () {

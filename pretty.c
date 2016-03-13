@@ -24,6 +24,11 @@ static size_t commit_formats_len;
 static size_t commit_formats_alloc;
 static struct cmt_fmt_map *find_commit_format(const char *sought);
 
+int commit_format_is_empty(enum cmit_fmt fmt)
+{
+	return fmt == CMIT_FMT_USERFORMAT && !*user_format;
+}
+
 static void save_user_format(struct rev_info *rev, const char *cp, int is_tformat)
 {
 	free(user_format);
@@ -40,10 +45,9 @@ static int git_pretty_formats_config(const char *var, const char *value, void *c
 	const char *fmt;
 	int i;
 
-	if (!starts_with(var, "pretty."))
+	if (!skip_prefix(var, "pretty.", &name))
 		return 0;
 
-	name = var + strlen("pretty.");
 	for (i = 0; i < builtin_formats_len; i++) {
 		if (!strcmp(commit_formats[i].name, name))
 			return 0;
@@ -66,11 +70,12 @@ static int git_pretty_formats_config(const char *var, const char *value, void *c
 
 	commit_format->name = xstrdup(name);
 	commit_format->format = CMIT_FMT_USERFORMAT;
-	git_config_string(&fmt, var, value);
-	if (starts_with(fmt, "format:") || starts_with(fmt, "tformat:")) {
-		commit_format->is_tformat = fmt[0] == 't';
-		fmt = strchr(fmt, ':') + 1;
-	} else if (strchr(fmt, '%'))
+	if (git_config_string(&fmt, var, value))
+		return -1;
+
+	if (skip_prefix(fmt, "format:", &fmt))
+		commit_format->is_tformat = 0;
+	else if (skip_prefix(fmt, "tformat:", &fmt) || strchr(fmt, '%'))
 		commit_format->is_tformat = 1;
 	else
 		commit_format->is_alias = 1;
@@ -147,16 +152,16 @@ void get_commit_format(const char *arg, struct rev_info *rev)
 	struct cmt_fmt_map *commit_format;
 
 	rev->use_terminator = 0;
-	if (!arg || !*arg) {
+	if (!arg) {
 		rev->commit_format = CMIT_FMT_DEFAULT;
 		return;
 	}
-	if (starts_with(arg, "format:") || starts_with(arg, "tformat:")) {
-		save_user_format(rev, strchr(arg, ':') + 1, arg[0] == 't');
+	if (skip_prefix(arg, "format:", &arg)) {
+		save_user_format(rev, arg, 0);
 		return;
 	}
 
-	if (strchr(arg, '%')) {
+	if (!*arg || skip_prefix(arg, "tformat:", &arg) || strchr(arg, '%')) {
 		save_user_format(rev, arg, 1);
 		return;
 	}
@@ -274,7 +279,7 @@ static void add_rfc822_quoted(struct strbuf *out, const char *s, int len)
 
 enum rfc2047_type {
 	RFC2047_SUBJECT,
-	RFC2047_ADDRESS,
+	RFC2047_ADDRESS
 };
 
 static int is_rfc2047_special(char ch, enum rfc2047_type type)
@@ -393,8 +398,8 @@ static void add_rfc2047(struct strbuf *sb, const char *line, size_t len,
 	strbuf_addstr(sb, "?=");
 }
 
-static const char *show_ident_date(const struct ident_split *ident,
-				   enum date_mode mode)
+const char *show_ident_date(const struct ident_split *ident,
+			    const struct date_mode *mode)
 {
 	unsigned long date = 0;
 	long tz = 0;
@@ -484,15 +489,15 @@ void pp_user_info(struct pretty_print_context *pp,
 	switch (pp->fmt) {
 	case CMIT_FMT_MEDIUM:
 		strbuf_addf(sb, "Date:   %s\n",
-			    show_ident_date(&ident, pp->date_mode));
+			    show_ident_date(&ident, &pp->date_mode));
 		break;
 	case CMIT_FMT_EMAIL:
 		strbuf_addf(sb, "Date: %s\n",
-			    show_ident_date(&ident, DATE_RFC2822));
+			    show_ident_date(&ident, DATE_MODE(RFC2822)));
 		break;
 	case CMIT_FMT_FULLER:
 		strbuf_addf(sb, "%sDate: %s\n", what,
-			    show_ident_date(&ident, pp->date_mode));
+			    show_ident_date(&ident, &pp->date_mode));
 		break;
 	default:
 		/* notin' */
@@ -538,9 +543,9 @@ static void add_merge_info(const struct pretty_print_context *pp,
 		struct commit *p = parent->item;
 		const char *hex = NULL;
 		if (pp->abbrev)
-			hex = find_unique_abbrev(p->object.sha1, pp->abbrev);
+			hex = find_unique_abbrev(p->object.oid.hash, pp->abbrev);
 		if (!hex)
-			hex = sha1_to_hex(p->object.sha1);
+			hex = oid_to_hex(&p->object.oid);
 		parent = parent->next;
 
 		strbuf_addf(sb, " %s", hex);
@@ -548,32 +553,11 @@ static void add_merge_info(const struct pretty_print_context *pp,
 	strbuf_addch(sb, '\n');
 }
 
-static char *get_header(const struct commit *commit, const char *msg,
-			const char *key)
+static char *get_header(const char *msg, const char *key)
 {
-	int key_len = strlen(key);
-	const char *line = msg;
-
-	while (line) {
-		const char *eol = strchr(line, '\n'), *next;
-
-		if (line == eol)
-			return NULL;
-		if (!eol) {
-			warning("malformed commit (header is missing newline): %s",
-				sha1_to_hex(commit->object.sha1));
-			eol = line + strlen(line);
-			next = NULL;
-		} else
-			next = eol + 1;
-		if (eol - line > key_len &&
-		    !strncmp(line, key, key_len) &&
-		    line[key_len] == ' ') {
-			return xmemdupz(line + key_len + 1, eol - line - key_len - 1);
-		}
-		line = next;
-	}
-	return NULL;
+	size_t len;
+	const char *v = find_commit_header(msg, key, &len);
+	return v ? xmemdupz(v, len) : NULL;
 }
 
 static char *replace_encoding_header(char *buf, const char *encoding)
@@ -583,7 +567,7 @@ static char *replace_encoding_header(char *buf, const char *encoding)
 	char *cp = buf;
 
 	/* guess if there is an encoding header before a \n\n */
-	while (strncmp(cp, "encoding ", strlen("encoding "))) {
+	while (!starts_with(cp, "encoding ")) {
 		cp = strchr(cp, '\n');
 		if (!cp || *++cp == '\n')
 			return buf;
@@ -607,36 +591,22 @@ static char *replace_encoding_header(char *buf, const char *encoding)
 	return strbuf_detach(&tmp, NULL);
 }
 
-char *logmsg_reencode(const struct commit *commit,
-		      char **commit_encoding,
-		      const char *output_encoding)
+const char *logmsg_reencode(const struct commit *commit,
+			    char **commit_encoding,
+			    const char *output_encoding)
 {
 	static const char *utf8 = "UTF-8";
 	const char *use_encoding;
 	char *encoding;
-	char *msg = commit->buffer;
+	const char *msg = get_commit_buffer(commit, NULL);
 	char *out;
-
-	if (!msg) {
-		enum object_type type;
-		unsigned long size;
-
-		msg = read_sha1_file(commit->object.sha1, &type, &size);
-		if (!msg)
-			die("Cannot read commit object %s",
-			    sha1_to_hex(commit->object.sha1));
-		if (type != OBJ_COMMIT)
-			die("Expected commit for '%s', got %s",
-			    sha1_to_hex(commit->object.sha1), typename(type));
-	}
 
 	if (!output_encoding || !*output_encoding) {
 		if (commit_encoding)
-			*commit_encoding =
-				get_header(commit, msg, "encoding");
+			*commit_encoding = get_header(msg, "encoding");
 		return msg;
 	}
-	encoding = get_header(commit, msg, "encoding");
+	encoding = get_header(msg, "encoding");
 	if (commit_encoding)
 		*commit_encoding = encoding;
 	use_encoding = encoding ? encoding : utf8;
@@ -653,12 +623,13 @@ char *logmsg_reencode(const struct commit *commit,
 		 * Otherwise, we still want to munge the encoding header in the
 		 * result, which will be done by modifying the buffer. If we
 		 * are using a fresh copy, we can reuse it. But if we are using
-		 * the cached copy from commit->buffer, we need to duplicate it
-		 * to avoid munging commit->buffer.
+		 * the cached copy from get_commit_buffer, we need to duplicate it
+		 * to avoid munging the cached copy.
 		 */
-		out = msg;
-		if (out == commit->buffer)
-			out = xstrdup(out);
+		if (msg == get_cached_commit_buffer(commit, NULL))
+			out = xstrdup(msg);
+		else
+			out = (char *)msg;
 	}
 	else {
 		/*
@@ -668,8 +639,8 @@ char *logmsg_reencode(const struct commit *commit,
 		 * copy, we can free it.
 		 */
 		out = reencode_string(msg, output_encoding, use_encoding);
-		if (out && msg != commit->buffer)
-			free(msg);
+		if (out)
+			unuse_commit_buffer(commit, msg);
 	}
 
 	/*
@@ -688,12 +659,6 @@ char *logmsg_reencode(const struct commit *commit,
 	return out ? out : msg;
 }
 
-void logmsg_free(char *msg, const struct commit *commit)
-{
-	if (msg != commit->buffer)
-		free(msg);
-}
-
 static int mailmap_name(const char **email, size_t *email_len,
 			const char **name, size_t *name_len)
 {
@@ -706,7 +671,8 @@ static int mailmap_name(const char **email, size_t *email_len,
 }
 
 static size_t format_person_part(struct strbuf *sb, char part,
-				 const char *msg, int len, enum date_mode dmode)
+				 const char *msg, int len,
+				 const struct date_mode *dmode)
 {
 	/* currently all placeholders have same length */
 	const int placeholder_len = 2;
@@ -746,13 +712,16 @@ static size_t format_person_part(struct strbuf *sb, char part,
 		strbuf_addstr(sb, show_ident_date(&s, dmode));
 		return placeholder_len;
 	case 'D':	/* date, RFC2822 style */
-		strbuf_addstr(sb, show_ident_date(&s, DATE_RFC2822));
+		strbuf_addstr(sb, show_ident_date(&s, DATE_MODE(RFC2822)));
 		return placeholder_len;
 	case 'r':	/* date, relative */
-		strbuf_addstr(sb, show_ident_date(&s, DATE_RELATIVE));
+		strbuf_addstr(sb, show_ident_date(&s, DATE_MODE(RELATIVE)));
 		return placeholder_len;
-	case 'i':	/* date, ISO 8601 */
-		strbuf_addstr(sb, show_ident_date(&s, DATE_ISO8601));
+	case 'i':	/* date, ISO 8601-like */
+		strbuf_addstr(sb, show_ident_date(&s, DATE_MODE(ISO8601)));
+		return placeholder_len;
+	case 'I':	/* date, ISO 8601 strict */
+		strbuf_addstr(sb, show_ident_date(&s, DATE_MODE(ISO8601_STRICT)));
 		return placeholder_len;
 	}
 
@@ -797,7 +766,7 @@ struct format_commit_context {
 	struct signature_check signature_check;
 	enum flush_type flush_type;
 	enum trunc_type truncate;
-	char *message;
+	const char *message;
 	char *commit_encoding;
 	size_t width, indent1, indent2;
 	int auto_color;
@@ -840,18 +809,19 @@ static void parse_commit_header(struct format_commit_context *context)
 	int i;
 
 	for (i = 0; msg[i]; i++) {
+		const char *name;
 		int eol;
 		for (eol = i; msg[eol] && msg[eol] != '\n'; eol++)
 			; /* do nothing */
 
 		if (i == eol) {
 			break;
-		} else if (starts_with(msg + i, "author ")) {
-			context->author.off = i + 7;
-			context->author.len = eol - i - 7;
-		} else if (starts_with(msg + i, "committer ")) {
-			context->committer.off = i + 10;
-			context->committer.len = eol - i - 10;
+		} else if (skip_prefix(msg + i, "author ", &name)) {
+			context->author.off = name - msg;
+			context->author.len = msg + eol - name;
+		} else if (skip_prefix(msg + i, "committer ", &name)) {
+			context->committer.off = name - msg;
+			context->committer.len = msg + eol - name;
 		}
 		i = eol;
 	}
@@ -964,7 +934,7 @@ static void rewrap_message_tail(struct strbuf *sb,
 static int format_reflog_person(struct strbuf *sb,
 				char part,
 				struct reflog_walk_info *log,
-				enum date_mode dmode)
+				const struct date_mode *dmode)
 {
 	const char *ident;
 
@@ -982,6 +952,8 @@ static size_t parse_color(struct strbuf *sb, /* in UTF-8 */
 			  const char *placeholder,
 			  struct format_commit_context *c)
 {
+	const char *rest = placeholder;
+
 	if (placeholder[1] == '(') {
 		const char *begin = placeholder + 2;
 		const char *end = strchr(begin, ')');
@@ -989,31 +961,24 @@ static size_t parse_color(struct strbuf *sb, /* in UTF-8 */
 
 		if (!end)
 			return 0;
-		if (starts_with(begin, "auto,")) {
+		if (skip_prefix(begin, "auto,", &begin)) {
 			if (!want_color(c->pretty_ctx->color))
 				return end - placeholder + 1;
-			begin += 5;
 		}
-		color_parse_mem(begin,
-				end - begin,
-				"--pretty format", color);
+		if (color_parse_mem(begin, end - begin, color) < 0)
+			die(_("unable to parse --pretty format"));
 		strbuf_addstr(sb, color);
 		return end - placeholder + 1;
 	}
-	if (starts_with(placeholder + 1, "red")) {
+	if (skip_prefix(placeholder + 1, "red", &rest))
 		strbuf_addstr(sb, GIT_COLOR_RED);
-		return 4;
-	} else if (starts_with(placeholder + 1, "green")) {
+	else if (skip_prefix(placeholder + 1, "green", &rest))
 		strbuf_addstr(sb, GIT_COLOR_GREEN);
-		return 6;
-	} else if (starts_with(placeholder + 1, "blue")) {
+	else if (skip_prefix(placeholder + 1, "blue", &rest))
 		strbuf_addstr(sb, GIT_COLOR_BLUE);
-		return 5;
-	} else if (starts_with(placeholder + 1, "reset")) {
+	else if (skip_prefix(placeholder + 1, "reset", &rest))
 		strbuf_addstr(sb, GIT_COLOR_RESET);
-		return 6;
-	} else
-		return 0;
+	return rest - placeholder;
 }
 
 static size_t parse_padding_placeholder(struct strbuf *sb,
@@ -1154,12 +1119,12 @@ static size_t format_commit_one(struct strbuf *sb, /* in UTF-8 */
 
 	/* these depend on the commit */
 	if (!commit->object.parsed)
-		parse_object(commit->object.sha1);
+		parse_object(commit->object.oid.hash);
 
 	switch (placeholder[0]) {
 	case 'H':		/* commit hash */
 		strbuf_addstr(sb, diff_get_color(c->auto_color, DIFF_COMMIT));
-		strbuf_addstr(sb, sha1_to_hex(commit->object.sha1));
+		strbuf_addstr(sb, oid_to_hex(&commit->object.oid));
 		strbuf_addstr(sb, diff_get_color(c->auto_color, DIFF_RESET));
 		return 1;
 	case 'h':		/* abbreviated commit hash */
@@ -1168,18 +1133,18 @@ static size_t format_commit_one(struct strbuf *sb, /* in UTF-8 */
 			strbuf_addstr(sb, diff_get_color(c->auto_color, DIFF_RESET));
 			return 1;
 		}
-		strbuf_addstr(sb, find_unique_abbrev(commit->object.sha1,
+		strbuf_addstr(sb, find_unique_abbrev(commit->object.oid.hash,
 						     c->pretty_ctx->abbrev));
 		strbuf_addstr(sb, diff_get_color(c->auto_color, DIFF_RESET));
 		c->abbrev_commit_hash.len = sb->len - c->abbrev_commit_hash.off;
 		return 1;
 	case 'T':		/* tree hash */
-		strbuf_addstr(sb, sha1_to_hex(commit->tree->object.sha1));
+		strbuf_addstr(sb, oid_to_hex(&commit->tree->object.oid));
 		return 1;
 	case 't':		/* abbreviated tree hash */
 		if (add_again(sb, &c->abbrev_tree_hash))
 			return 1;
-		strbuf_addstr(sb, find_unique_abbrev(commit->tree->object.sha1,
+		strbuf_addstr(sb, find_unique_abbrev(commit->tree->object.oid.hash,
 						     c->pretty_ctx->abbrev));
 		c->abbrev_tree_hash.len = sb->len - c->abbrev_tree_hash.off;
 		return 1;
@@ -1187,7 +1152,7 @@ static size_t format_commit_one(struct strbuf *sb, /* in UTF-8 */
 		for (p = commit->parents; p; p = p->next) {
 			if (p != commit->parents)
 				strbuf_addch(sb, ' ');
-			strbuf_addstr(sb, sha1_to_hex(p->item->object.sha1));
+			strbuf_addstr(sb, oid_to_hex(&p->item->object.oid));
 		}
 		return 1;
 	case 'p':		/* abbreviated parent hashes */
@@ -1197,7 +1162,7 @@ static size_t format_commit_one(struct strbuf *sb, /* in UTF-8 */
 			if (p != commit->parents)
 				strbuf_addch(sb, ' ');
 			strbuf_addstr(sb, find_unique_abbrev(
-					p->item->object.sha1,
+					p->item->object.oid.hash,
 					c->pretty_ctx->abbrev));
 		}
 		c->abbrev_parent_hashes.len = sb->len -
@@ -1210,6 +1175,10 @@ static size_t format_commit_one(struct strbuf *sb, /* in UTF-8 */
 		load_ref_decorations(DECORATE_SHORT_REFS);
 		format_decorations(sb, commit, c->auto_color);
 		return 1;
+	case 'D':
+		load_ref_decorations(DECORATE_SHORT_REFS);
+		format_decorations_extended(sb, commit, c->auto_color, "", ", ", "");
+		return 1;
 	case 'g':		/* reflog info */
 		switch(placeholder[1]) {
 		case 'd':	/* reflog selector */
@@ -1217,7 +1186,7 @@ static size_t format_commit_one(struct strbuf *sb, /* in UTF-8 */
 			if (c->pretty_ctx->reflog_info)
 				get_reflog_selector(sb,
 						    c->pretty_ctx->reflog_info,
-						    c->pretty_ctx->date_mode,
+						    &c->pretty_ctx->date_mode,
 						    c->pretty_ctx->date_mode_explicit,
 						    (placeholder[1] == 'd'));
 			return 2;
@@ -1232,7 +1201,7 @@ static size_t format_commit_one(struct strbuf *sb, /* in UTF-8 */
 			return format_reflog_person(sb,
 						    placeholder[1],
 						    c->pretty_ctx->reflog_info,
-						    c->pretty_ctx->date_mode);
+						    &c->pretty_ctx->date_mode);
 		}
 		return 0;	/* unknown %g placeholder */
 	case 'N':
@@ -1268,6 +1237,8 @@ static size_t format_commit_one(struct strbuf *sb, /* in UTF-8 */
 			if (c->signature_check.key)
 				strbuf_addstr(sb, c->signature_check.key);
 			break;
+		default:
+			return 0;
 		}
 		return 2;
 	}
@@ -1281,11 +1252,11 @@ static size_t format_commit_one(struct strbuf *sb, /* in UTF-8 */
 	case 'a':	/* author ... */
 		return format_person_part(sb, placeholder[1],
 				   msg + c->author.off, c->author.len,
-				   c->pretty_ctx->date_mode);
+				   &c->pretty_ctx->date_mode);
 	case 'c':	/* committer ... */
 		return format_person_part(sb, placeholder[1],
 				   msg + c->committer.off, c->committer.len,
-				   c->pretty_ctx->date_mode);
+				   &c->pretty_ctx->date_mode);
 	case 'e':	/* encoding */
 		if (c->commit_encoding)
 			strbuf_addstr(sb, c->commit_encoding);
@@ -1394,7 +1365,7 @@ static size_t format_and_pad_commit(struct strbuf *sb, /* in UTF-8 */
 		case trunc_none:
 			break;
 		}
-		strbuf_addstr(sb, local_sb.buf);
+		strbuf_addbuf(sb, &local_sb);
 	} else {
 		int sb_len = sb->len, offset = 0;
 		if (c->flush_type == flush_left)
@@ -1406,9 +1377,7 @@ static size_t format_and_pad_commit(struct strbuf *sb, /* in UTF-8 */
 		 * convert it back to chars
 		 */
 		padding = padding - len + local_sb.len;
-		strbuf_grow(sb, padding);
-		strbuf_setlen(sb, sb_len + padding);
-		memset(sb->buf + sb_len, ' ', sb->len - sb_len);
+		strbuf_addchars(sb, ' ', padding);
 		memcpy(sb->buf + sb_len + offset, local_sb.buf,
 		       local_sb.len);
 	}
@@ -1507,13 +1476,18 @@ void format_commit_message(const struct commit *commit,
 	context.commit = commit;
 	context.pretty_ctx = pretty_ctx;
 	context.wrap_start = sb->len;
+	/*
+	 * convert a commit message to UTF-8 first
+	 * as far as 'format_commit_item' assumes it in UTF-8
+	 */
 	context.message = logmsg_reencode(commit,
 					  &context.commit_encoding,
-					  output_enc);
+					  utf8);
 
 	strbuf_expand(sb, format, format_commit_item, &context);
 	rewrap_message_tail(sb, &context, 0, 0, 0);
 
+	/* then convert a commit message to an actual output encoding */
 	if (output_enc) {
 		if (same_encoding(utf8, output_enc))
 			output_enc = NULL;
@@ -1532,9 +1506,7 @@ void format_commit_message(const struct commit *commit,
 	}
 
 	free(context.commit_encoding);
-	logmsg_free(context.message, commit);
-	free(context.signature_check.gpg_output);
-	free(context.signature_check.signer);
+	unuse_commit_buffer(commit, context.message);
 }
 
 static void pp_header(struct pretty_print_context *pp,
@@ -1546,7 +1518,7 @@ static void pp_header(struct pretty_print_context *pp,
 	int parents_shown = 0;
 
 	for (;;) {
-		const char *line = *msg_p;
+		const char *name, *line = *msg_p;
 		int linelen = get_one_line(*msg_p);
 
 		if (!linelen)
@@ -1569,12 +1541,7 @@ static void pp_header(struct pretty_print_context *pp,
 		}
 
 		if (!parents_shown) {
-			struct commit_list *parent;
-			int num;
-			for (parent = commit->parents, num = 0;
-			     parent;
-			     parent = parent->next, num++)
-				;
+			unsigned num = commit_list_count(commit->parents);
 			/* with enough slop */
 			strbuf_grow(sb, num * 50 + 20);
 			add_merge_info(pp, sb, commit);
@@ -1586,14 +1553,14 @@ static void pp_header(struct pretty_print_context *pp,
 		 * FULL shows both authors but not dates.
 		 * FULLER shows both authors and dates.
 		 */
-		if (starts_with(line, "author ")) {
+		if (skip_prefix(line, "author ", &name)) {
 			strbuf_grow(sb, linelen + 80);
-			pp_user_info(pp, "Author", sb, line + 7, encoding);
+			pp_user_info(pp, "Author", sb, name, encoding);
 		}
-		if (starts_with(line, "committer ") &&
+		if (skip_prefix(line, "committer ", &name) &&
 		    (pp->fmt == CMIT_FMT_FULL || pp->fmt == CMIT_FMT_FULLER)) {
 			strbuf_grow(sb, linelen + 80);
-			pp_user_info(pp, "Commit", sb, line + 10, encoding);
+			pp_user_info(pp, "Commit", sb, name, encoding);
 		}
 	}
 }
@@ -1685,10 +1652,8 @@ void pp_remainder(struct pretty_print_context *pp,
 		first = 0;
 
 		strbuf_grow(sb, linelen + indent + 20);
-		if (indent) {
-			memset(sb->buf + sb->len, ' ', indent);
-			strbuf_setlen(sb, sb->len + indent);
-		}
+		if (indent)
+			strbuf_addchars(sb, ' ', indent);
 		strbuf_add(sb, line, linelen);
 		strbuf_addch(sb, '\n');
 	}
@@ -1701,7 +1666,7 @@ void pretty_print_commit(struct pretty_print_context *pp,
 	unsigned long beginning_of_body;
 	int indent = 4;
 	const char *msg;
-	char *reencoded;
+	const char *reencoded;
 	const char *encoding;
 	int need_8bit_cte = pp->need_8bit_cte;
 
@@ -1768,7 +1733,7 @@ void pretty_print_commit(struct pretty_print_context *pp,
 	if (pp->fmt == CMIT_FMT_EMAIL && sb->len <= beginning_of_body)
 		strbuf_addch(sb, '\n');
 
-	logmsg_free(reencoded, commit);
+	unuse_commit_buffer(commit, reencoded);
 }
 
 void pp_commit_easy(enum cmit_fmt fmt, const struct commit *commit,

@@ -13,8 +13,7 @@
 /*
  * We detect based on the cURL version if multi-transfer is
  * usable in this implementation and define this symbol accordingly.
- * This is not something Makefile should set nor users should pass
- * via CFLAGS.
+ * This shouldn't be set by the Makefile or by the user (e.g. via CFLAGS).
  */
 #undef USE_CURL_MULTI
 
@@ -55,6 +54,7 @@ struct slot_results {
 	CURLcode curl_result;
 	long http_code;
 	long auth_avail;
+	long http_connectcode;
 };
 
 struct active_request_slot {
@@ -86,9 +86,7 @@ extern curlioerr ioctl_buffer(CURL *handle, int cmd, void *clientp);
 extern struct active_request_slot *get_active_slot(void);
 extern int start_active_slot(struct active_request_slot *slot);
 extern void run_active_slot(struct active_request_slot *slot);
-extern void finish_active_slot(struct active_request_slot *slot);
 extern void finish_all_active_slots(void);
-extern int handle_curl_result(struct slot_results *results);
 
 /*
  * This will run one slot to completion in a blocking manner, similar to how
@@ -109,6 +107,7 @@ extern void http_init(struct remote *remote, const char *url,
 		      int proactive_auth);
 extern void http_cleanup(void);
 
+extern long int git_curl_ipresolve;
 extern int active_requests;
 extern int http_is_verbose;
 extern size_t http_post_buffer;
@@ -143,6 +142,13 @@ struct http_get_options {
 
 	/* If non-NULL, returns the content-type of the response. */
 	struct strbuf *content_type;
+
+	/*
+	 * If non-NULL, and content_type above is non-NULL, returns
+	 * the charset parameter from the content-type. If none is
+	 * present, returns an empty string.
+	 */
+	struct strbuf *charset;
 
 	/*
 	 * If non-NULL, returns the URL we ended up at, including any
@@ -186,7 +192,6 @@ struct http_pack_request {
 	struct packed_git **lst;
 	FILE *packfile;
 	char tmpfile[PATH_MAX];
-	struct curl_slist *range_header;
 	struct active_request_slot *slot;
 };
 

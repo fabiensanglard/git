@@ -30,11 +30,28 @@
 # Copyright (c) 2008 Clemens Buchacher <drizzd@aon.at>
 #
 
+if test -n "$NO_CURL"
+then
+	skip_all='skipping test, git built without http support'
+	test_done
+fi
+
+if test -n "$NO_EXPAT" && test -n "$LIB_HTTPD_DAV"
+then
+	skip_all='skipping test, git built without expat support'
+	test_done
+fi
+
 test_tristate GIT_TEST_HTTPD
 if test "$GIT_TEST_HTTPD" = false
 then
 	skip_all="Network testing disabled (unset GIT_TEST_HTTPD to enable)"
 	test_done
+fi
+
+if ! test_have_prereq NOT_ROOT; then
+	test_skip_or_die $GIT_TEST_HTTPD \
+		"Cannot run httpd tests as root"
 fi
 
 HTTPD_PARA=""
@@ -74,14 +91,15 @@ HTTPD_DOCUMENT_ROOT_PATH=$HTTPD_ROOT_PATH/www
 # hack to suppress apache PassEnv warnings
 GIT_VALGRIND=$GIT_VALGRIND; export GIT_VALGRIND
 GIT_VALGRIND_OPTIONS=$GIT_VALGRIND_OPTIONS; export GIT_VALGRIND_OPTIONS
+GIT_TRACE=$GIT_TRACE; export GIT_TRACE
 
 if ! test -x "$LIB_HTTPD_PATH"
 then
 	test_skip_or_die $GIT_TEST_HTTPD "no web server found at '$LIB_HTTPD_PATH'"
 fi
 
-HTTPD_VERSION=`$LIB_HTTPD_PATH -v | \
-	sed -n 's/^Server version: Apache\/\([0-9]*\)\..*$/\1/p; q'`
+HTTPD_VERSION=$($LIB_HTTPD_PATH -v | \
+	sed -n 's/^Server version: Apache\/\([0-9]*\)\..*$/\1/p; q')
 
 if test -n "$HTTPD_VERSION"
 then
@@ -105,10 +123,15 @@ else
 		"Could not identify web server at '$LIB_HTTPD_PATH'"
 fi
 
+install_script () {
+	write_script "$HTTPD_ROOT_PATH/$1" <"$TEST_PATH/$1"
+}
+
 prepare_httpd() {
 	mkdir -p "$HTTPD_DOCUMENT_ROOT_PATH"
 	cp "$TEST_PATH"/passwd "$HTTPD_ROOT_PATH"
-	cp "$TEST_PATH"/broken-smart-http.sh "$HTTPD_ROOT_PATH"
+	install_script broken-smart-http.sh
+	install_script error.sh
 
 	ln -s "$LIB_HTTPD_MODULE_PATH" "$HTTPD_ROOT_PATH/modules"
 
@@ -132,7 +155,7 @@ prepare_httpd() {
 	HTTPD_URL_USER=$HTTPD_PROTO://user%40host@$HTTPD_DEST
 	HTTPD_URL_USER_PASS=$HTTPD_PROTO://user%40host:pass%40host@$HTTPD_DEST
 
-	if test -n "$LIB_HTTPD_DAV" -o -n "$LIB_HTTPD_SVN"
+	if test -n "$LIB_HTTPD_DAV" || test -n "$LIB_HTTPD_SVN"
 	then
 		HTTPD_PARA="$HTTPD_PARA -DDAV"
 

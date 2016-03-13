@@ -35,9 +35,41 @@ test_expect_success 'objects in packs marked .keep are not repacked' '
 	test -z "$found_duplicate_object"
 '
 
+test_expect_success 'writing bitmaps via command-line can duplicate .keep objects' '
+	# build on $objsha1, $packsha1, and .keep state from previous
+	git repack -Adbl &&
+	test_when_finished "found_duplicate_object=" &&
+	for p in .git/objects/pack/*.idx; do
+		idx=$(basename $p)
+		test "pack-$packsha1.idx" = "$idx" && continue
+		if git verify-pack -v $p | egrep "^$objsha1"; then
+			found_duplicate_object=1
+			echo "DUPLICATE OBJECT FOUND"
+			break
+		fi
+	done &&
+	test "$found_duplicate_object" = 1
+'
+
+test_expect_success 'writing bitmaps via config can duplicate .keep objects' '
+	# build on $objsha1, $packsha1, and .keep state from previous
+	git -c repack.writebitmaps=true repack -Adl &&
+	test_when_finished "found_duplicate_object=" &&
+	for p in .git/objects/pack/*.idx; do
+		idx=$(basename $p)
+		test "pack-$packsha1.idx" = "$idx" && continue
+		if git verify-pack -v $p | egrep "^$objsha1"; then
+			found_duplicate_object=1
+			echo "DUPLICATE OBJECT FOUND"
+			break
+		fi
+	done &&
+	test "$found_duplicate_object" = 1
+'
+
 test_expect_success 'loose objects in alternate ODB are not repacked' '
 	mkdir alt_objects &&
-	echo `pwd`/alt_objects > .git/objects/info/alternates &&
+	echo $(pwd)/alt_objects > .git/objects/info/alternates &&
 	echo content3 > file3 &&
 	objsha1=$(GIT_OBJECT_DIRECTORY=alt_objects git hash-object -w file3) &&
 	git add file3 &&
@@ -136,7 +168,7 @@ test_expect_success 'packed unreachable obs in alternate ODB are not loosened' '
 '
 
 test_expect_success 'local packed unreachable obs that exist in alternate ODB are not loosened' '
-	echo `pwd`/alt_objects > .git/objects/info/alternates &&
+	echo $(pwd)/alt_objects > .git/objects/info/alternates &&
 	echo "$csha1" | git pack-objects --non-empty --all --reflog pack &&
 	rm -f .git/objects/pack/* &&
 	mv pack-* .git/objects/pack/ &&

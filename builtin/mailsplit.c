@@ -53,14 +53,15 @@ static int keep_cr;
  */
 static int split_one(FILE *mbox, const char *name, int allow_bare)
 {
-	FILE *output = NULL;
+	FILE *output;
 	int fd;
 	int status = 0;
 	int is_bare = !is_from_line(buf.buf, buf.len);
 
-	if (is_bare && !allow_bare)
-		goto corrupt;
-
+	if (is_bare && !allow_bare) {
+		fprintf(stderr, "corrupt mailbox\n");
+		exit(1);
+	}
 	fd = open(name, O_WRONLY | O_CREAT | O_EXCL, 0666);
 	if (fd < 0)
 		die_errno("cannot open output file '%s'", name);
@@ -91,43 +92,43 @@ static int split_one(FILE *mbox, const char *name, int allow_bare)
 	}
 	fclose(output);
 	return status;
-
- corrupt:
-	if (output)
-		fclose(output);
-	unlink(name);
-	fprintf(stderr, "corrupt mailbox\n");
-	exit(1);
 }
 
 static int populate_maildir_list(struct string_list *list, const char *path)
 {
 	DIR *dir;
 	struct dirent *dent;
-	char name[PATH_MAX];
+	char *name = NULL;
 	char *subs[] = { "cur", "new", NULL };
 	char **sub;
+	int ret = -1;
 
 	for (sub = subs; *sub; ++sub) {
-		snprintf(name, sizeof(name), "%s/%s", path, *sub);
+		free(name);
+		name = xstrfmt("%s/%s", path, *sub);
 		if ((dir = opendir(name)) == NULL) {
 			if (errno == ENOENT)
 				continue;
 			error("cannot opendir %s (%s)", name, strerror(errno));
-			return -1;
+			goto out;
 		}
 
 		while ((dent = readdir(dir)) != NULL) {
 			if (dent->d_name[0] == '.')
 				continue;
-			snprintf(name, sizeof(name), "%s/%s", *sub, dent->d_name);
+			free(name);
+			name = xstrfmt("%s/%s", *sub, dent->d_name);
 			string_list_insert(list, name);
 		}
 
 		closedir(dir);
 	}
 
-	return 0;
+	ret = 0;
+
+out:
+	free(name);
+	return ret;
 }
 
 static int maildir_filename_cmp(const char *a, const char *b)
@@ -154,8 +155,8 @@ static int maildir_filename_cmp(const char *a, const char *b)
 static int split_maildir(const char *maildir, const char *dir,
 	int nr_prec, int skip)
 {
-	char file[PATH_MAX];
-	char name[PATH_MAX];
+	char *file = NULL;
+	FILE *f = NULL;
 	int ret = -1;
 	int i;
 	struct string_list list = STRING_LIST_INIT_DUP;
@@ -166,8 +167,11 @@ static int split_maildir(const char *maildir, const char *dir,
 		goto out;
 
 	for (i = 0; i < list.nr; i++) {
-		FILE *f;
-		snprintf(file, sizeof(file), "%s/%s", maildir, list.items[i].string);
+		char *name;
+
+		free(file);
+		file = xstrfmt("%s/%s", maildir, list.items[i].string);
+
 		f = fopen(file, "r");
 		if (!f) {
 			error("cannot open mail %s (%s)", file, strerror(errno));
@@ -179,14 +183,19 @@ static int split_maildir(const char *maildir, const char *dir,
 			goto out;
 		}
 
-		sprintf(name, "%s/%0*d", dir, nr_prec, ++skip);
+		name = xstrfmt("%s/%0*d", dir, nr_prec, ++skip);
 		split_one(f, name, 1);
+		free(name);
 
 		fclose(f);
+		f = NULL;
 	}
 
 	ret = skip;
 out:
+	if (f)
+		fclose(f);
+	free(file);
 	string_list_clear(&list, 1);
 	return ret;
 }
@@ -194,7 +203,6 @@ out:
 static int split_mbox(const char *file, const char *dir, int allow_bare,
 		      int nr_prec, int skip)
 {
-	char name[PATH_MAX];
 	int ret = -1;
 	int peek;
 
@@ -221,8 +229,9 @@ static int split_mbox(const char *file, const char *dir, int allow_bare,
 	}
 
 	while (!file_done) {
-		sprintf(name, "%s/%0*d", dir, nr_prec, ++skip);
+		char *name = xstrfmt("%s/%0*d", dir, nr_prec, ++skip);
 		file_done = split_one(f, name, allow_bare);
+		free(name);
 	}
 
 	if (f != stdin)

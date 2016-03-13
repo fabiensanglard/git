@@ -49,7 +49,7 @@ static struct option builtin_help_options[] = {
 };
 
 static const char * const builtin_help_usage[] = {
-	N_("git help [--all] [--guides] [--man|--web|--info] [command]"),
+	N_("git help [--all] [--guides] [--man | --web | --info] [<command>]"),
 	NULL
 };
 
@@ -79,12 +79,11 @@ static const char *get_man_viewer_info(const char *name)
 static int check_emacsclient_version(void)
 {
 	struct strbuf buffer = STRBUF_INIT;
-	struct child_process ec_process;
+	struct child_process ec_process = CHILD_PROCESS_INIT;
 	const char *argv_ec[] = { "emacsclient", "--version", NULL };
 	int version;
 
 	/* emacsclient prints its version number on stderr */
-	memset(&ec_process, 0, sizeof(ec_process));
 	ec_process.argv = argv_ec;
 	ec_process.err = -1;
 	ec_process.stdout_to_stderr = 1;
@@ -141,17 +140,10 @@ static void exec_man_konqueror(const char *path, const char *page)
 
 		/* It's simpler to launch konqueror using kfmclient. */
 		if (path) {
-			const char *file = strrchr(path, '/');
-			if (file && !strcmp(file + 1, "konqueror")) {
-				char *new = xstrdup(path);
-				char *dest = strrchr(new, '/');
-
-				/* strlen("konqueror") == strlen("kfmclient") */
-				strcpy(dest + 1, "kfmclient");
-				path = new;
-			}
-			if (file)
-				filename = file;
+			size_t len;
+			if (strip_suffix(path, "/konqueror", &len))
+				path = xstrfmt("%.*s/kfmclient", (int)len, path);
+			filename = basename((char *)path);
 		} else
 			path = "kfmclient";
 		strbuf_addf(&man_page, "man:%s(1)", page);
@@ -172,19 +164,17 @@ static void exec_man_cmd(const char *cmd, const char *page)
 {
 	struct strbuf shell_cmd = STRBUF_INIT;
 	strbuf_addf(&shell_cmd, "%s %s", cmd, page);
-	execl("/bin/sh", "sh", "-c", shell_cmd.buf, (char *)NULL);
+	execl(SHELL_PATH, SHELL_PATH, "-c", shell_cmd.buf, (char *)NULL);
 	warning(_("failed to exec '%s': %s"), cmd, strerror(errno));
 }
 
 static void add_man_viewer(const char *name)
 {
 	struct man_viewer_list **p = &man_viewer_list;
-	size_t len = strlen(name);
 
 	while (*p)
 		p = &((*p)->next);
-	*p = xcalloc(1, (sizeof(**p) + len + 1));
-	strncpy((*p)->name, name, len);
+	FLEX_ALLOC_STR(*p, name, name);
 }
 
 static int supported_man_viewer(const char *name, size_t len)
@@ -198,9 +188,8 @@ static void do_add_man_viewer_info(const char *name,
 				   size_t len,
 				   const char *value)
 {
-	struct man_viewer_info_list *new = xcalloc(1, sizeof(*new) + len + 1);
-
-	strncpy(new->name, name, len);
+	struct man_viewer_info_list *new;
+	FLEX_ALLOC_MEM(new, name, name, len);
 	new->info = xstrdup(value);
 	new->next = man_viewer_info_list;
 	man_viewer_info_list = new;
@@ -296,16 +285,6 @@ static int is_git_command(const char *s)
 		is_in_cmdlist(&other_cmds, s);
 }
 
-static const char *prepend(const char *prefix, const char *cmd)
-{
-	size_t pre_len = strlen(prefix);
-	size_t cmd_len = strlen(cmd);
-	char *p = xmalloc(pre_len + cmd_len + 1);
-	memcpy(p, prefix, pre_len);
-	strcpy(p + pre_len, cmd);
-	return p;
-}
-
 static const char *cmd_to_page(const char *git_cmd)
 {
 	if (!git_cmd)
@@ -313,25 +292,27 @@ static const char *cmd_to_page(const char *git_cmd)
 	else if (starts_with(git_cmd, "git"))
 		return git_cmd;
 	else if (is_git_command(git_cmd))
-		return prepend("git-", git_cmd);
+		return xstrfmt("git-%s", git_cmd);
 	else
-		return prepend("git", git_cmd);
+		return xstrfmt("git%s", git_cmd);
 }
 
 static void setup_man_path(void)
 {
 	struct strbuf new_path = STRBUF_INIT;
 	const char *old_path = getenv("MANPATH");
+	char *git_man_path = system_path(GIT_MAN_PATH);
 
 	/* We should always put ':' after our path. If there is no
 	 * old_path, the ':' at the end will let 'man' to try
 	 * system-wide paths after ours to find the manual page. If
 	 * there is old_path, we need ':' as delimiter. */
-	strbuf_addstr(&new_path, system_path(GIT_MAN_PATH));
+	strbuf_addstr(&new_path, git_man_path);
 	strbuf_addch(&new_path, ':');
 	if (old_path)
 		strbuf_addstr(&new_path, old_path);
 
+	free(git_man_path);
 	setenv("MANPATH", new_path.buf, 1);
 
 	strbuf_release(&new_path);
@@ -381,8 +362,10 @@ static void show_info_page(const char *git_cmd)
 static void get_html_page_path(struct strbuf *page_path, const char *page)
 {
 	struct stat st;
+	char *to_free = NULL;
+
 	if (!html_path)
-		html_path = system_path(GIT_HTML_PATH);
+		html_path = to_free = system_path(GIT_HTML_PATH);
 
 	/* Check that we have a git documentation directory. */
 	if (!strstr(html_path, "://")) {
@@ -393,6 +376,7 @@ static void get_html_page_path(struct strbuf *page_path, const char *page)
 
 	strbuf_init(page_path, 0);
 	strbuf_addf(page_path, "%s/%s.html", html_path, page);
+	free(to_free);
 }
 
 /*
@@ -422,6 +406,7 @@ static struct {
 	const char *help;
 } common_guides[] = {
 	{ "attributes", N_("Defining attributes per path") },
+	{ "everyday", N_("Everyday Git With 20 Commands Or So") },
 	{ "glossary", N_("A Git glossary") },
 	{ "ignore", N_("Specifies intentionally untracked files to ignore") },
 	{ "modules", N_("Defining submodule properties") },
@@ -451,7 +436,7 @@ static void list_common_guides_help(void)
 int cmd_help(int argc, const char **argv, const char *prefix)
 {
 	int nongit;
-	const char *alias;
+	char *alias;
 	enum help_format parsed_help_format;
 
 	argc = parse_options(argc, argv, prefix, builtin_help_options,
@@ -494,6 +479,7 @@ int cmd_help(int argc, const char **argv, const char *prefix)
 	alias = alias_lookup(argv[0]);
 	if (alias && !is_git_command(argv[0])) {
 		printf_ln(_("`git %s' is aliased to `%s'"), argv[0], alias);
+		free(alias);
 		return 0;
 	}
 

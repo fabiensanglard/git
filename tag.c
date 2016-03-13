@@ -4,16 +4,13 @@
 #include "tree.h"
 #include "blob.h"
 
-#define PGP_SIGNATURE "-----BEGIN PGP SIGNATURE-----"
-#define PGP_MESSAGE "-----BEGIN PGP MESSAGE-----"
-
 const char *tag_type = "tag";
 
 struct object *deref_tag(struct object *o, const char *warn, int warnlen)
 {
 	while (o && o->type == OBJ_TAG)
 		if (((struct tag *)o)->tagged)
-			o = parse_object(((struct tag *)o)->tagged->sha1);
+			o = parse_object(((struct tag *)o)->tagged->oid.hash);
 		else
 			o = NULL;
 	if (!o && warn) {
@@ -27,7 +24,7 @@ struct object *deref_tag(struct object *o, const char *warn, int warnlen)
 struct object *deref_tag_noverify(struct object *o)
 {
 	while (o && o->type == OBJ_TAG) {
-		o = parse_object(o->sha1);
+		o = parse_object(o->oid.hash);
 		if (o && o->type == OBJ_TAG && ((struct tag *)o)->tagged)
 			o = ((struct tag *)o)->tagged;
 		else
@@ -40,15 +37,8 @@ struct tag *lookup_tag(const unsigned char *sha1)
 {
 	struct object *obj = lookup_object(sha1);
 	if (!obj)
-		return create_object(sha1, OBJ_TAG, alloc_tag_node());
-	if (!obj->type)
-		obj->type = OBJ_TAG;
-	if (obj->type != OBJ_TAG) {
-		error("Object %s is a %s, not a tag",
-		      sha1_to_hex(sha1), typename(obj->type));
-		return NULL;
-	}
-	return (struct tag *) obj;
+		return create_object(sha1, alloc_tag_node());
+	return object_as_type(obj, OBJ_TAG, 0);
 }
 
 static unsigned long parse_tag_date(const char *buf, const char *tail)
@@ -92,7 +82,7 @@ int parse_tag_buffer(struct tag *item, const void *data, unsigned long size)
 	nl = memchr(bufptr, '\n', tail - bufptr);
 	if (!nl || sizeof(type) <= (nl - bufptr))
 		return -1;
-	strncpy(type, bufptr, nl - bufptr);
+	memcpy(type, bufptr, nl - bufptr);
 	type[nl - bufptr] = '\0';
 	bufptr = nl + 1;
 
@@ -137,33 +127,16 @@ int parse_tag(struct tag *item)
 
 	if (item->object.parsed)
 		return 0;
-	data = read_sha1_file(item->object.sha1, &type, &size);
+	data = read_sha1_file(item->object.oid.hash, &type, &size);
 	if (!data)
 		return error("Could not read %s",
-			     sha1_to_hex(item->object.sha1));
+			     oid_to_hex(&item->object.oid));
 	if (type != OBJ_TAG) {
 		free(data);
 		return error("Object %s not a tag",
-			     sha1_to_hex(item->object.sha1));
+			     oid_to_hex(&item->object.oid));
 	}
 	ret = parse_tag_buffer(item, data, size);
 	free(data);
 	return ret;
-}
-
-/*
- * Look at a signed tag object, and return the offset where
- * the embedded detached signature begins, or the end of the
- * data when there is no such signature.
- */
-size_t parse_signature(const char *buf, unsigned long size)
-{
-	char *eol;
-	size_t len = 0;
-	while (len < size && !starts_with(buf + len, PGP_SIGNATURE) &&
-			!starts_with(buf + len, PGP_MESSAGE)) {
-		eol = memchr(buf + len, '\n', size - len);
-		len += eol ? eol - (buf + len) + 1 : size - len;
-	}
-	return len;
 }

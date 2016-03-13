@@ -3,6 +3,10 @@
 test_description='exercise basic bitmap functionality'
 . ./test-lib.sh
 
+objpath () {
+	echo ".git/objects/$(echo "$1" | sed -e 's|\(..\)|\1/|')"
+}
+
 test_expect_success 'setup repo with moderate-sized history' '
 	for i in $(test_seq 1 10); do
 		test_commit $i
@@ -14,7 +18,7 @@ test_expect_success 'setup repo with moderate-sized history' '
 	git checkout master &&
 	blob=$(echo tagged-blob | git hash-object -w --stdin) &&
 	git tag tagged-blob $blob &&
-	git config pack.writebitmaps true &&
+	git config repack.writebitmaps true &&
 	git config pack.writebitmaphashcache true
 '
 
@@ -46,6 +50,12 @@ rev_list_tests() {
 	test_expect_success "counting non-linear history ($state)" '
 		git rev-list --count other...master >expect &&
 		git rev-list --use-bitmap-index --count other...master >actual &&
+		test_cmp expect actual
+	'
+
+	test_expect_success "counting commits with limiting ($state)" '
+		git rev-list --count HEAD -- 1.t >expect &&
+		git rev-list --use-bitmap-index --count HEAD -- 1.t >actual &&
 		test_cmp expect actual
 	'
 
@@ -91,7 +101,10 @@ test_expect_success 'fetch (partial bitmap)' '
 
 test_expect_success 'incremental repack cannot create bitmaps' '
 	test_commit more-1 &&
-	test_must_fail git repack -d
+	find .git/objects/pack -name "*.bitmap" >expect &&
+	git repack -d &&
+	find .git/objects/pack -name "*.bitmap" >actual &&
+	test_cmp expect actual
 '
 
 test_expect_success 'incremental repack can disable bitmaps' '
@@ -110,6 +123,33 @@ test_expect_success 'fetch (full bitmap)' '
 	git rev-parse HEAD >expect &&
 	git --git-dir=clone.git rev-parse HEAD >actual &&
 	test_cmp expect actual
+'
+
+test_expect_success 'create objects for missing-HAVE tests' '
+	blob=$(echo "missing have" | git hash-object -w --stdin) &&
+	tree=$(printf "100644 blob $blob\tfile\n" | git mktree) &&
+	parent=$(echo parent | git commit-tree $tree) &&
+	commit=$(echo commit | git commit-tree $tree -p $parent) &&
+	cat >revs <<-EOF
+	HEAD
+	^HEAD^
+	^$commit
+	EOF
+'
+
+test_expect_success 'pack with missing blob' '
+	rm $(objpath $blob) &&
+	git pack-objects --stdout --revs <revs >/dev/null
+'
+
+test_expect_success 'pack with missing tree' '
+	rm $(objpath $tree) &&
+	git pack-objects --stdout --revs <revs >/dev/null
+'
+
+test_expect_success 'pack with missing parent' '
+	rm $(objpath $parent) &&
+	git pack-objects --stdout --revs <revs >/dev/null
 '
 
 test_lazy_prereq JGIT '
@@ -134,6 +174,15 @@ test_expect_success JGIT 'jgit can read our bitmaps' '
 		# jgit gc will barf if it does not like our bitmaps
 		jgit gc
 	)
+'
+
+test_expect_success 'splitting packs does not generate bogus bitmaps' '
+	test-genrandom foo $((1024 * 1024)) >rand &&
+	git add rand &&
+	git commit -m "commit with big file" &&
+	git -c pack.packSizeLimit=500k repack -adb &&
+	git init --bare no-bitmaps.git &&
+	git -C no-bitmaps.git fetch .. HEAD
 '
 
 test_done

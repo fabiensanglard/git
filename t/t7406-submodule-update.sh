@@ -14,8 +14,8 @@ submodule and "git submodule update --rebase/--merge" does not detach the HEAD.
 
 compare_head()
 {
-    sha_master=`git rev-list --max-count=1 master`
-    sha_head=`git rev-list --max-count=1 HEAD`
+    sha_master=$(git rev-list --max-count=1 master)
+    sha_head=$(git rev-list --max-count=1 HEAD)
 
     test "$sha_master" = "$sha_head"
 }
@@ -63,9 +63,6 @@ test_expect_success 'setup a submodule tree' '
 	 git submodule add ../none none &&
 	 test_tick &&
 	 git commit -m "none"
-	) &&
-	(cd super &&
-	 git tag initial-setup
 	)
 '
 
@@ -706,7 +703,7 @@ test_expect_success 'submodule update places git-dir in superprojects git-dir re
 	git clone super_update_r super_update_r2 &&
 	(cd super_update_r2 &&
 	 git submodule update --init --recursive >actual &&
-	 test_i18ngrep "Submodule path .submodule/subsubmodule.: .git reset --hard -q" actual &&
+	 test_i18ngrep "Submodule path .submodule/subsubmodule.: checked out" actual &&
 	 (cd submodule/subsubmodule &&
 	  git log > ../../expected
 	 ) &&
@@ -757,7 +754,7 @@ test_expect_success SYMLINKS 'submodule update can handle symbolic links in pwd'
 
 test_expect_success 'submodule update clone shallow submodule' '
 	git clone cloned super3 &&
-	pwd=$(pwd)
+	pwd=$(pwd) &&
 	(cd super3 &&
 	 sed -e "s#url = ../#url = file://$pwd/#" <.gitmodules >.gitmodules.tmp &&
 	 mv -f .gitmodules.tmp .gitmodules &&
@@ -777,38 +774,4 @@ test_expect_success 'submodule update --recursive drops module name before recur
 	 test_i18ngrep "Submodule path .deeper/submodule/subsubmodule.: checked out" actual
 	)
 '
-
-test_expect_success 'submodule update --checkout clones detached HEAD' '
-	git clone super super4 &&
-	echo "detached HEAD" >expected &&
-	(cd super4 &&
-	 git reset --hard initial-setup &&
-	 git submodule init submodule &&
-	 git submodule update >> /tmp/log 2>&1 &&
-	 (cd submodule &&
-	  git symbolic-ref HEAD > ../../actual ||
-	  echo "detached HEAD" > ../../actual
-	 )
-	) &&
-	test_cmp actual expected &&
-	rm -rf super4
-'
-
-test_expect_success 'submodule update --merge clones attached HEAD' '
-	git clone super super4 &&
-	echo "refs/heads/master" >expected &&
-	(cd super4 &&
-	 git reset --hard initial-setup &&
-	 git submodule init submodule &&
-	 git config submodule.submodule.update merge &&
-	 git submodule update --merge &&
-	 (cd submodule &&
-	  git symbolic-ref HEAD > ../../actual ||
-	  echo "detached HEAD" > ../../actual
-	 )
-	) &&
-	test_cmp actual expected &&
-	rm -rf super4
-'
-
 test_done

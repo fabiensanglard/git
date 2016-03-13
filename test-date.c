@@ -19,19 +19,21 @@ static void show_dates(char **argv, struct timeval *now)
 
 static void parse_dates(char **argv, struct timeval *now)
 {
+	struct strbuf result = STRBUF_INIT;
+
 	for (; *argv; argv++) {
-		char result[100];
 		unsigned long t;
 		int tz;
 
-		result[0] = 0;
-		parse_date(*argv, result, sizeof(result));
-		if (sscanf(result, "%lu %d", &t, &tz) == 2)
+		strbuf_reset(&result);
+		parse_date(*argv, &result);
+		if (sscanf(result.buf, "%lu %d", &t, &tz) == 2)
 			printf("%s -> %s\n",
-			       *argv, show_date(t, tz, DATE_ISO8601));
+			       *argv, show_date(t, tz, DATE_MODE(ISO8601)));
 		else
 			printf("%s -> bad\n", *argv);
 	}
+	strbuf_release(&result);
 }
 
 static void parse_approxidate(char **argv, struct timeval *now)
@@ -39,7 +41,7 @@ static void parse_approxidate(char **argv, struct timeval *now)
 	for (; *argv; argv++) {
 		time_t t;
 		t = approxidate_relative(*argv, now);
-		printf("%s -> %s\n", *argv, show_date(t, 0, DATE_ISO8601));
+		printf("%s -> %s\n", *argv, show_date(t, 0, DATE_MODE(ISO8601)));
 	}
 }
 

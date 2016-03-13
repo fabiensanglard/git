@@ -6,6 +6,7 @@
 #include "tree-walk.h"
 #include "refs.h"
 #include "remote.h"
+#include "dir.h"
 
 static int get_sha1_oneline(const char *, unsigned char *, struct commit_list *);
 
@@ -86,20 +87,23 @@ static void find_short_object_filename(int len, const char *hex_pfx, struct disa
 		 * object databases including our own.
 		 */
 		const char *objdir = get_object_directory();
-		int objdir_len = strlen(objdir);
-		int entlen = objdir_len + 43;
-		fakeent = xmalloc(sizeof(*fakeent) + entlen);
+		size_t objdir_len = strlen(objdir);
+		fakeent = xmalloc(st_add3(sizeof(*fakeent), objdir_len, 43));
 		memcpy(fakeent->base, objdir, objdir_len);
 		fakeent->name = fakeent->base + objdir_len + 1;
 		fakeent->name[-1] = '/';
 	}
 	fakeent->next = alt_odb_list;
 
-	sprintf(hex, "%.2s", hex_pfx);
+	xsnprintf(hex, sizeof(hex), "%.2s", hex_pfx);
 	for (alt = fakeent; alt && !ds->ambiguous; alt = alt->next) {
 		struct dirent *de;
 		DIR *dir;
-		sprintf(alt->name, "%.2s/", hex_pfx);
+		/*
+		 * every alt_odb struct has 42 extra bytes after the base
+		 * for exactly this purpose
+		 */
+		xsnprintf(alt->name, 42, "%.2s/", hex_pfx);
 		dir = opendir(alt->base);
 		if (!dir)
 			continue;
@@ -367,15 +371,14 @@ int for_each_abbrev(const char *prefix, each_abbrev_fn fn, void *cb_data)
 	return ds.ambiguous;
 }
 
-const char *find_unique_abbrev(const unsigned char *sha1, int len)
+int find_unique_abbrev_r(char *hex, const unsigned char *sha1, int len)
 {
 	int status, exists;
-	static char hex[41];
 
-	exists = has_sha1_file(sha1);
-	memcpy(hex, sha1_to_hex(sha1), 40);
+	sha1_to_hex_r(hex, sha1);
 	if (len == 40 || !len)
-		return hex;
+		return 40;
+	exists = has_sha1_file(sha1);
 	while (len < 40) {
 		unsigned char sha1_ret[20];
 		status = get_short_sha1(hex, len, sha1_ret, GET_SHA1_QUIETLY);
@@ -383,10 +386,17 @@ const char *find_unique_abbrev(const unsigned char *sha1, int len)
 		    ? !status
 		    : status == SHORT_NAME_NOT_FOUND) {
 			hex[len] = 0;
-			return hex;
+			return len;
 		}
 		len++;
 	}
+	return len;
+}
+
+const char *find_unique_abbrev(const unsigned char *sha1, int len)
+{
+	static char hex[GIT_SHA1_HEXSZ + 1];
+	find_unique_abbrev_r(hex, sha1, len);
 	return hex;
 }
 
@@ -415,12 +425,12 @@ static int ambiguous_path(const char *path, int len)
 	return slash;
 }
 
-static inline int upstream_mark(const char *string, int len)
+static inline int at_mark(const char *string, int len,
+			  const char **suffix, int nr)
 {
-	const char *suffix[] = { "@{upstream}", "@{u}" };
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(suffix); i++) {
+	for (i = 0; i < nr; i++) {
 		int suffix_len = strlen(suffix[i]);
 		if (suffix_len <= len
 		    && !memcmp(string, suffix[i], suffix_len))
@@ -429,10 +439,23 @@ static inline int upstream_mark(const char *string, int len)
 	return 0;
 }
 
+static inline int upstream_mark(const char *string, int len)
+{
+	const char *suffix[] = { "@{upstream}", "@{u}" };
+	return at_mark(string, len, suffix, ARRAY_SIZE(suffix));
+}
+
+static inline int push_mark(const char *string, int len)
+{
+	const char *suffix[] = { "@{push}" };
+	return at_mark(string, len, suffix, ARRAY_SIZE(suffix));
+}
+
 static int get_sha1_1(const char *name, int len, unsigned char *sha1, unsigned lookup_flags);
 static int interpret_nth_prior_checkout(const char *name, int namelen, struct strbuf *buf);
 
-static int get_sha1_basic(const char *str, int len, unsigned char *sha1)
+static int get_sha1_basic(const char *str, int len, unsigned char *sha1,
+			  unsigned int flags)
 {
 	static const char *warn_msg = "refname '%.*s' is ambiguous.";
 	static const char *object_name_msg = N_(
@@ -475,7 +498,8 @@ static int get_sha1_basic(const char *str, int len, unsigned char *sha1)
 					nth_prior = 1;
 					continue;
 				}
-				if (!upstream_mark(str + at, len - at)) {
+				if (!upstream_mark(str + at, len - at) &&
+				    !push_mark(str + at, len - at)) {
 					reflog_len = (len-1) - (at+2);
 					len = at;
 				}
@@ -511,7 +535,7 @@ static int get_sha1_basic(const char *str, int len, unsigned char *sha1)
 	if (!refs_found)
 		return -1;
 
-	if (warn_ambiguous_refs &&
+	if (warn_ambiguous_refs && !(flags & GET_SHA1_QUIETLY) &&
 	    (refs_found > 1 ||
 	     !get_short_sha1(str, len, tmp_sha1, GET_SHA1_QUIETLY)))
 		warning(warn_msg, len, str);
@@ -540,10 +564,12 @@ static int get_sha1_basic(const char *str, int len, unsigned char *sha1)
 			char *tmp = xstrndup(str + at + 2, reflog_len);
 			at_time = approxidate_careful(tmp, &errors);
 			free(tmp);
-			if (errors)
+			if (errors) {
+				free(real_ref);
 				return -1;
+			}
 		}
-		if (read_ref_at(real_ref, at_time, nth, sha1, NULL,
+		if (read_ref_at(real_ref, flags, at_time, nth, sha1, NULL,
 				&co_time, &co_tz, &co_cnt)) {
 			if (!len) {
 				if (starts_with(real_ref, "refs/heads/")) {
@@ -555,11 +581,16 @@ static int get_sha1_basic(const char *str, int len, unsigned char *sha1)
 					len = 4;
 				}
 			}
-			if (at_time)
-				warning("Log for '%.*s' only goes "
-					"back to %s.", len, str,
-					show_date(co_time, co_tz, DATE_RFC2822));
-			else {
+			if (at_time) {
+				if (!(flags & GET_SHA1_QUIETLY)) {
+					warning("Log for '%.*s' only goes "
+						"back to %s.", len, str,
+						show_date(co_time, co_tz, DATE_MODE(RFC2822)));
+				}
+			} else {
+				if (flags & GET_SHA1_QUIETLY) {
+					exit(128);
+				}
 				die("Log for '%.*s' only has %d entries.",
 				    len, str, co_cnt);
 			}
@@ -584,13 +615,13 @@ static int get_parent(const char *name, int len,
 	if (parse_commit(commit))
 		return -1;
 	if (!idx) {
-		hashcpy(result, commit->object.sha1);
+		hashcpy(result, commit->object.oid.hash);
 		return 0;
 	}
 	p = commit->parents;
 	while (p) {
 		if (!--idx) {
-			hashcpy(result, p->item->object.sha1);
+			hashcpy(result, p->item->object.oid.hash);
 			return 0;
 		}
 		p = p->next;
@@ -617,7 +648,7 @@ static int get_nth_ancestor(const char *name, int len,
 			return -1;
 		commit = commit->parents->item;
 	}
-	hashcpy(result, commit->object.sha1);
+	hashcpy(result, commit->object.oid.hash);
 	return 0;
 }
 
@@ -627,7 +658,7 @@ struct object *peel_to_type(const char *name, int namelen,
 	if (name && !namelen)
 		namelen = strlen(name);
 	while (1) {
-		if (!o || (!o->parsed && !parse_object(o->sha1)))
+		if (!o || (!o->parsed && !parse_object(o->oid.hash)))
 			return NULL;
 		if (expected_type == OBJ_ANY || o->type == expected_type)
 			return o;
@@ -704,9 +735,9 @@ static int peel_onion(const char *name, int len, unsigned char *sha1)
 		return -1;
 	if (!expected_type) {
 		o = deref_tag(o, name, sp - name - 2);
-		if (!o || (!o->parsed && !parse_object(o->sha1)))
+		if (!o || (!o->parsed && !parse_object(o->oid.hash)))
 			return -1;
-		hashcpy(sha1, o->sha1);
+		hashcpy(sha1, o->oid.hash);
 		return 0;
 	}
 
@@ -719,7 +750,7 @@ static int peel_onion(const char *name, int len, unsigned char *sha1)
 	if (!o)
 		return -1;
 
-	hashcpy(sha1, o->sha1);
+	hashcpy(sha1, o->oid.hash);
 	if (sp[0] == '/') {
 		/* "$commit^{/foo}" */
 		char *prefix;
@@ -749,7 +780,7 @@ static int get_describe_name(const char *name, int len, unsigned char *sha1)
 
 	for (cp = name + len - 1; name + 2 <= cp; cp--) {
 		char ch = *cp;
-		if (hexval(ch) & ~0377) {
+		if (!isxdigit(ch)) {
 			/* We must be looking at g in "SOMETHING-g"
 			 * for it to be describe output.
 			 */
@@ -799,7 +830,7 @@ static int get_sha1_1(const char *name, int len, unsigned char *sha1, unsigned l
 	if (!ret)
 		return 0;
 
-	ret = get_sha1_basic(name, len, sha1);
+	ret = get_sha1_basic(name, len, sha1, lookup_flags);
 	if (!ret)
 		return 0;
 
@@ -816,16 +847,22 @@ static int get_sha1_1(const char *name, int len, unsigned char *sha1, unsigned l
  * through history and returning the first commit whose message starts
  * the given regular expression.
  *
- * For future extension, ':/!' is reserved. If you want to match a message
- * beginning with a '!', you have to repeat the exclamation mark.
+ * For negative-matching, prefix the pattern-part with '!-', like: ':/!-WIP'.
+ *
+ * For a literal '!' character at the beginning of a pattern, you have to repeat
+ * that, like: ':/!!foo'
+ *
+ * For future extension, all other sequences beginning with ':/!' are reserved.
  */
+
+/* Remember to update object flag allocation in object.h */
 #define ONELINE_SEEN (1u<<20)
 
-static int handle_one_ref(const char *path,
-		const unsigned char *sha1, int flag, void *cb_data)
+static int handle_one_ref(const char *path, const struct object_id *oid,
+			  int flag, void *cb_data)
 {
 	struct commit_list **list = cb_data;
-	struct object *object = parse_object(sha1);
+	struct object *object = parse_object(oid->hash);
 	if (!object)
 		return 0;
 	if (object->type == OBJ_TAG) {
@@ -835,7 +872,7 @@ static int handle_one_ref(const char *path,
 	}
 	if (object->type != OBJ_COMMIT)
 		return 0;
-	commit_list_insert_by_date((struct commit *)object, list);
+	commit_list_insert((struct commit *)object, list);
 	return 0;
 }
 
@@ -844,46 +881,42 @@ static int get_sha1_oneline(const char *prefix, unsigned char *sha1,
 {
 	struct commit_list *backup = NULL, *l;
 	int found = 0;
+	int negative = 0;
 	regex_t regex;
 
 	if (prefix[0] == '!') {
-		if (prefix[1] != '!')
-			die ("Invalid search pattern: %s", prefix);
 		prefix++;
+
+		if (prefix[0] == '-') {
+			prefix++;
+			negative = 1;
+		} else if (prefix[0] != '!') {
+			return -1;
+		}
 	}
 
 	if (regcomp(&regex, prefix, REG_EXTENDED))
-		die("Invalid search pattern: %s", prefix);
+		return -1;
 
 	for (l = list; l; l = l->next) {
 		l->item->object.flags |= ONELINE_SEEN;
 		commit_list_insert(l->item, &backup);
 	}
 	while (list) {
-		char *p, *to_free = NULL;
+		const char *p, *buf;
 		struct commit *commit;
-		enum object_type type;
-		unsigned long size;
 		int matches;
 
 		commit = pop_most_recent_commit(&list, ONELINE_SEEN);
-		if (!parse_object(commit->object.sha1))
+		if (!parse_object(commit->object.oid.hash))
 			continue;
-		if (commit->buffer)
-			p = commit->buffer;
-		else {
-			p = read_sha1_file(commit->object.sha1, &type, &size);
-			if (!p)
-				continue;
-			to_free = p;
-		}
-
-		p = strstr(p, "\n\n");
-		matches = p && !regexec(&regex, p + 2, 0, NULL, 0);
-		free(to_free);
+		buf = get_commit_buffer(commit, NULL);
+		p = strstr(buf, "\n\n");
+		matches = negative ^ (p && !regexec(&regex, p + 2, 0, NULL, 0));
+		unuse_commit_buffer(commit, buf);
 
 		if (matches) {
-			hashcpy(sha1, commit->object.sha1);
+			hashcpy(sha1, commit->object.oid.hash);
 			found = 1;
 			break;
 		}
@@ -909,10 +942,8 @@ static int grab_nth_branch_switch(unsigned char *osha1, unsigned char *nsha1,
 	const char *match = NULL, *target = NULL;
 	size_t len;
 
-	if (starts_with(message, "checkout: moving from ")) {
-		match = message + strlen("checkout: moving from ");
+	if (skip_prefix(message, "checkout: moving from ", &match))
 		target = strstr(match, " to ");
-	}
 
 	if (!match || !target)
 		return 0;
@@ -956,7 +987,7 @@ static int interpret_nth_prior_checkout(const char *name, int namelen,
 	retval = 0;
 	if (0 < for_each_reflog_ent_reverse("HEAD", grab_nth_branch_switch, &cb)) {
 		strbuf_reset(buf);
-		strbuf_add(buf, cb.buf.buf, cb.buf.len);
+		strbuf_addbuf(buf, &cb.buf);
 		retval = brace - name + 1;
 	}
 
@@ -995,12 +1026,12 @@ int get_sha1_mb(const char *name, unsigned char *sha1)
 	two = lookup_commit_reference_gently(sha1_tmp, 0);
 	if (!two)
 		return -1;
-	mbs = get_merge_bases(one, two, 1);
+	mbs = get_merge_bases(one, two);
 	if (!mbs || mbs->next)
 		st = -1;
 	else {
 		st = 0;
-		hashcpy(sha1, mbs->item->object.sha1);
+		hashcpy(sha1, mbs->item->object.oid.hash);
 	}
 	free_commit_list(mbs);
 	return st;
@@ -1057,46 +1088,36 @@ static void set_shortened_ref(struct strbuf *buf, const char *ref)
 	free(s);
 }
 
-static const char *get_upstream_branch(const char *branch_buf, int len)
-{
-	char *branch = xstrndup(branch_buf, len);
-	struct branch *upstream = branch_get(*branch ? branch : NULL);
-
-	/*
-	 * Upstream can be NULL only if branch refers to HEAD and HEAD
-	 * points to something different than a branch.
-	 */
-	if (!upstream)
-		die(_("HEAD does not point to a branch"));
-	if (!upstream->merge || !upstream->merge[0]->dst) {
-		if (!ref_exists(upstream->refname))
-			die(_("No such branch: '%s'"), branch);
-		if (!upstream->merge) {
-			die(_("No upstream configured for branch '%s'"),
-				upstream->name);
-		}
-		die(
-			_("Upstream branch '%s' not stored as a remote-tracking branch"),
-			upstream->merge[0]->src);
-	}
-	free(branch);
-
-	return upstream->merge[0]->dst;
-}
-
-static int interpret_upstream_mark(const char *name, int namelen,
-				   int at, struct strbuf *buf)
+static int interpret_branch_mark(const char *name, int namelen,
+				 int at, struct strbuf *buf,
+				 int (*get_mark)(const char *, int),
+				 const char *(*get_data)(struct branch *,
+							 struct strbuf *))
 {
 	int len;
+	struct branch *branch;
+	struct strbuf err = STRBUF_INIT;
+	const char *value;
 
-	len = upstream_mark(name + at, namelen - at);
+	len = get_mark(name + at, namelen - at);
 	if (!len)
 		return -1;
 
 	if (memchr(name, ':', at))
 		return -1;
 
-	set_shortened_ref(buf, get_upstream_branch(name, at));
+	if (at) {
+		char *name_str = xmemdupz(name, at);
+		branch = branch_get(name_str);
+		free(name_str);
+	} else
+		branch = branch_get(NULL);
+
+	value = get_data(branch, &err);
+	if (!value)
+		die("%s", err.buf);
+
+	set_shortened_ref(buf, value);
 	return len + at;
 }
 
@@ -1147,7 +1168,13 @@ int interpret_branch_name(const char *name, int namelen, struct strbuf *buf)
 		if (len > 0)
 			return reinterpret(name, namelen, len, buf);
 
-		len = interpret_upstream_mark(name, namelen, at - name, buf);
+		len = interpret_branch_mark(name, namelen, at - name, buf,
+					    upstream_mark, branch_get_upstream);
+		if (len > 0)
+			return len;
+
+		len = interpret_branch_mark(name, namelen, at - name, buf,
+					    push_mark, branch_get_push);
 		if (len > 0)
 			return len;
 	}
@@ -1239,21 +1266,17 @@ static void diagnose_invalid_sha1_path(const char *prefix,
 				       const char *object_name,
 				       int object_name_len)
 {
-	struct stat st;
 	unsigned char sha1[20];
 	unsigned mode;
 
 	if (!prefix)
 		prefix = "";
 
-	if (!lstat(filename, &st))
+	if (file_exists(filename))
 		die("Path '%s' exists on disk, but not in '%.*s'.",
 		    filename, object_name_len, object_name);
 	if (errno == ENOENT || errno == ENOTDIR) {
-		char *fullname = xmalloc(strlen(filename)
-					     + strlen(prefix) + 1);
-		strcpy(fullname, prefix);
-		strcat(fullname, filename);
+		char *fullname = xstrfmt("%s%s", prefix, filename);
 
 		if (!get_tree_entry(tree_sha1, fullname,
 				    sha1, &mode)) {
@@ -1276,12 +1299,10 @@ static void diagnose_invalid_index_path(int stage,
 					const char *prefix,
 					const char *filename)
 {
-	struct stat st;
 	const struct cache_entry *ce;
 	int pos;
 	unsigned namelen = strlen(filename);
-	unsigned fullnamelen;
-	char *fullname;
+	struct strbuf fullname = STRBUF_INIT;
 
 	if (!prefix)
 		prefix = "";
@@ -1301,31 +1322,29 @@ static void diagnose_invalid_index_path(int stage,
 	}
 
 	/* Confusion between relative and absolute filenames? */
-	fullnamelen = namelen + strlen(prefix);
-	fullname = xmalloc(fullnamelen + 1);
-	strcpy(fullname, prefix);
-	strcat(fullname, filename);
-	pos = cache_name_pos(fullname, fullnamelen);
+	strbuf_addstr(&fullname, prefix);
+	strbuf_addstr(&fullname, filename);
+	pos = cache_name_pos(fullname.buf, fullname.len);
 	if (pos < 0)
 		pos = -pos - 1;
 	if (pos < active_nr) {
 		ce = active_cache[pos];
-		if (ce_namelen(ce) == fullnamelen &&
-		    !memcmp(ce->name, fullname, fullnamelen))
+		if (ce_namelen(ce) == fullname.len &&
+		    !memcmp(ce->name, fullname.buf, fullname.len))
 			die("Path '%s' is in the index, but not '%s'.\n"
 			    "Did you mean ':%d:%s' aka ':%d:./%s'?",
-			    fullname, filename,
-			    ce_stage(ce), fullname,
+			    fullname.buf, filename,
+			    ce_stage(ce), fullname.buf,
 			    ce_stage(ce), filename);
 	}
 
-	if (!lstat(filename, &st))
+	if (file_exists(filename))
 		die("Path '%s' exists on disk, but not in the index.", filename);
 	if (errno == ENOENT || errno == ENOTDIR)
 		die("Path '%s' does not exist (neither on disk nor in the index).",
 		    filename);
 
-	free(fullname);
+	strbuf_release(&fullname);
 }
 
 
@@ -1376,7 +1395,9 @@ static int get_sha1_with_context_1(const char *name,
 		int pos;
 		if (!only_to_die && namelen > 2 && name[1] == '/') {
 			struct commit_list *list = NULL;
+
 			for_each_ref(handle_one_ref, &list);
+			commit_list_sort_by_date(&list);
 			return get_sha1_oneline(name + 2, sha1, list);
 		}
 		if (namelen < 3 ||
@@ -1395,9 +1416,7 @@ static int get_sha1_with_context_1(const char *name,
 			namelen = strlen(cp);
 		}
 
-		strncpy(oc->path, cp,
-			sizeof(oc->path));
-		oc->path[sizeof(oc->path)-1] = '\0';
+		strlcpy(oc->path, cp, sizeof(oc->path));
 
 		if (!active_cache)
 			read_cache();
@@ -1440,16 +1459,22 @@ static int get_sha1_with_context_1(const char *name,
 			new_filename = resolve_relative_path(filename);
 			if (new_filename)
 				filename = new_filename;
-			ret = get_tree_entry(tree_sha1, filename, sha1, &oc->mode);
-			if (ret && only_to_die) {
-				diagnose_invalid_sha1_path(prefix, filename,
-							   tree_sha1,
-							   name, len);
+			if (flags & GET_SHA1_FOLLOW_SYMLINKS) {
+				ret = get_tree_entry_follow_symlinks(tree_sha1,
+					filename, sha1, &oc->symlink_path,
+					&oc->mode);
+			} else {
+				ret = get_tree_entry(tree_sha1, filename,
+						     sha1, &oc->mode);
+				if (ret && only_to_die) {
+					diagnose_invalid_sha1_path(prefix,
+								   filename,
+								   tree_sha1,
+								   name, len);
+				}
 			}
 			hashcpy(oc->tree, tree_sha1);
-			strncpy(oc->path, filename,
-				sizeof(oc->path));
-			oc->path[sizeof(oc->path)-1] = '\0';
+			strlcpy(oc->path, filename, sizeof(oc->path));
 
 			free(new_filename);
 			return ret;
@@ -1477,5 +1502,7 @@ void maybe_die_on_misspelt_object_name(const char *name, const char *prefix)
 
 int get_sha1_with_context(const char *str, unsigned flags, unsigned char *sha1, struct object_context *orc)
 {
+	if (flags & GET_SHA1_FOLLOW_SYMLINKS && flags & GET_SHA1_ONLY_TO_DIE)
+		die("BUG: incompatible flags for get_sha1_with_context");
 	return get_sha1_with_context_1(str, flags, NULL, sha1, orc);
 }

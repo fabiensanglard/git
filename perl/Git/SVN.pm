@@ -9,11 +9,10 @@ use vars qw/$_no_metadata
 	    $_use_log_author $_add_author_from $_localtime/;
 use Carp qw/croak/;
 use File::Path qw/mkpath/;
-use File::Copy qw/copy/;
 use IPC::Open3;
 use Memoize;  # core since 5.8.0, Jul 2002
-use Memoize::Storable;
 use POSIX qw(:signal_h);
+use Time::Local;
 
 use Git qw(
     command
@@ -32,11 +31,7 @@ use Git::SVN::Utils qw(
 	add_path_to_url
 );
 
-my $can_use_yaml;
-BEGIN {
-	$can_use_yaml = eval { require Git::SVN::Memoize::YAML; 1};
-}
-
+my $memo_backend;
 our $_follow_parent  = 1;
 our $_minimize_url   = 'unset';
 our $default_repo_id = 'svn';
@@ -480,8 +475,8 @@ sub refname {
 	# It cannot end with a slash /, we'll throw up on this because
 	# SVN can't have directories with a slash in their name, either:
 	if ($refname =~ m{/$}) {
-		die "ref: '$refname' ends with a trailing slash, this is ",
-		    "not permitted by git nor Subversion\n";
+		die "ref: '$refname' ends with a trailing slash; this is ",
+		    "not permitted by git or Subversion\n";
 	}
 
 	# It cannot have ASCII control character space, tilde ~, caret ^,
@@ -1178,7 +1173,7 @@ sub find_parent_branch {
 			  or die "SVN connection failed somewhere...\n";
 		}
 		print STDERR "Successfully followed parent\n" unless $::_q > 1;
-		return $self->make_log_entry($rev, [$parent], $ed);
+		return $self->make_log_entry($rev, [$parent], $ed, $r0, $branch_from);
 	}
 	return undef;
 }
@@ -1191,7 +1186,7 @@ sub do_fetch {
 		# we can have a branch that was deleted, then re-added
 		# under the same name but copied from another path, in
 		# which case we'll have multiple parents (we don't
-		# want to break the original ref, nor lose copypath info):
+		# want to break the original ref or lose copypath info):
 		if (my $log_entry = $self->find_parent_branch($paths, $rev)) {
 			push @{$log_entry->{parents}}, $lc;
 			return $log_entry;
@@ -1210,26 +1205,93 @@ sub do_fetch {
 	unless ($self->ra->gs_do_update($last_rev, $rev, $self, $ed)) {
 		die "SVN connection failed somewhere...\n";
 	}
-	$self->make_log_entry($rev, \@parents, $ed);
+	$self->make_log_entry($rev, \@parents, $ed, $last_rev, $self->path);
 }
 
 sub mkemptydirs {
 	my ($self, $r) = @_;
 
+	# add/remove/collect a paths table
+	#
+	# Paths are split into a tree of nodes, stored as a hash of hashes.
+	#
+	# Each node contains a 'path' entry for the path (if any) associated
+	# with that node and a 'children' entry for any nodes under that
+	# location.
+	#
+	# Removing a path requires a hash lookup for each component then
+	# dropping that node (and anything under it), which is substantially
+	# faster than a grep slice into a single hash of paths for large
+	# numbers of paths.
+	#
+	# For a large (200K) number of empty_dir directives this reduces
+	# scanning time to 3 seconds vs 10 minutes for grep+delete on a single
+	# hash of paths.
+	sub add_path {
+		my ($paths_table, $path) = @_;
+		my $node_ref;
+
+		foreach my $x (split('/', $path)) {
+			if (!exists($paths_table->{$x})) {
+				$paths_table->{$x} = { children => {} };
+			}
+
+			$node_ref = $paths_table->{$x};
+			$paths_table = $paths_table->{$x}->{children};
+		}
+
+		$node_ref->{path} = $path;
+	}
+
+	sub remove_path {
+		my ($paths_table, $path) = @_;
+		my $nodes_ref;
+		my $node_name;
+
+		foreach my $x (split('/', $path)) {
+			if (!exists($paths_table->{$x})) {
+				return;
+			}
+
+			$nodes_ref = $paths_table;
+			$node_name = $x;
+
+			$paths_table = $paths_table->{$x}->{children};
+		}
+
+		delete($nodes_ref->{$node_name});
+	}
+
+	sub collect_paths {
+		my ($paths_table, $paths_ref) = @_;
+
+		foreach my $v (values %$paths_table) {
+			my $p = $v->{path};
+			my $c = $v->{children};
+
+			collect_paths($c, $paths_ref);
+
+			if (defined($p)) {
+				push(@$paths_ref, $p);
+			}
+		}
+	}
+
 	sub scan {
-		my ($r, $empty_dirs, $line) = @_;
+		my ($r, $paths_table, $line) = @_;
 		if (defined $r && $line =~ /^r(\d+)$/) {
 			return 0 if $1 > $r;
 		} elsif ($line =~ /^  \+empty_dir: (.+)$/) {
-			$empty_dirs->{$1} = 1;
+			add_path($paths_table, $1);
 		} elsif ($line =~ /^  \-empty_dir: (.+)$/) {
-			my @d = grep {m[^\Q$1\E(/|$)]} (keys %$empty_dirs);
-			delete @$empty_dirs{@d};
+			remove_path($paths_table, $1);
 		}
 		1; # continue
 	};
 
-	my %empty_dirs = ();
+	my @empty_dirs;
+	my %paths_table;
+
 	my $gz_file = "$self->{dir}/unhandled.log.gz";
 	if (-f $gz_file) {
 		if (!can_compress()) {
@@ -1240,7 +1302,7 @@ sub mkemptydirs {
 				die "Unable to open $gz_file: $!\n";
 			my $line;
 			while ($gz->gzreadline($line) > 0) {
-				scan($r, \%empty_dirs, $line) or last;
+				scan($r, \%paths_table, $line) or last;
 			}
 			$gz->gzclose;
 		}
@@ -1249,13 +1311,14 @@ sub mkemptydirs {
 	if (open my $fh, '<', "$self->{dir}/unhandled.log") {
 		binmode $fh or croak "binmode: $!";
 		while (<$fh>) {
-			scan($r, \%empty_dirs, $_) or last;
+			scan($r, \%paths_table, $_) or last;
 		}
 		close $fh;
 	}
 
+	collect_paths(\%paths_table, \@empty_dirs);
 	my $strip = qr/\A\Q@{[$self->path]}\E(?:\/|$)/;
-	foreach my $d (sort keys %empty_dirs) {
+	foreach my $d (sort @empty_dirs) {
 		$d = uri_decode($d);
 		$d =~ s/$strip//;
 		next unless length($d);
@@ -1321,7 +1384,7 @@ sub get_untracked {
 sub parse_svn_date {
 	my $date = shift || return '+0000 1970-01-01 00:00:00';
 	my ($Y,$m,$d,$H,$M,$S) = ($date =~ /^(\d{4})\-(\d\d)\-(\d\d)T
-	                                    (\d\d)\:(\d\d)\:(\d\d)\.\d*Z$/x) or
+	                                    (\d\d?)\:(\d\d)\:(\d\d)\.\d*Z$/x) or
 	                                 croak "Unable to parse date: $date\n";
 	my $parsed_date;    # Set next.
 
@@ -1332,7 +1395,7 @@ sub parse_svn_date {
 		$ENV{TZ} = 'UTC';
 
 		my $epoch_in_UTC =
-		    POSIX::strftime('%s', $S, $M, $H, $d, $m - 1, $Y - 1900);
+		    Time::Local::timelocal($S, $M, $H, $d, $m - 1, $Y - 1900);
 
 		# Determine our local timezone (including DST) at the
 		# time of $epoch_in_UTC.  $Git::SVN::Log::TZ stored the
@@ -1433,7 +1496,7 @@ sub check_author {
 }
 
 sub find_extra_svk_parents {
-	my ($self, $ed, $tickets, $parents) = @_;
+	my ($self, $tickets, $parents) = @_;
 	# aha!  svk:merge property changed...
 	my @tickets = split "\n", $tickets;
 	my @known_parents;
@@ -1478,9 +1541,9 @@ sub find_extra_svk_parents {
 sub lookup_svn_merge {
 	my $uuid = shift;
 	my $url = shift;
-	my $merge = shift;
+	my $source = shift;
+	my $revs = shift;
 
-	my ($source, $revs) = split ":", $merge;
 	my $path = $source;
 	$path =~ s{^/}{};
 	my $gs = Git::SVN->find_by_url($url.$source, $url, $path);
@@ -1537,7 +1600,7 @@ sub _rev_list {
 	@rv;
 }
 
-sub check_cherry_pick {
+sub check_cherry_pick2 {
 	my $base = shift;
 	my $tip = shift;
 	my $parents = shift;
@@ -1552,7 +1615,8 @@ sub check_cherry_pick {
 			delete $commits{$commit};
 		}
 	}
-	return (keys %commits);
+	my @k = (keys %commits);
+	return (scalar @k, $k[0]);
 }
 
 sub has_no_changes {
@@ -1577,7 +1641,16 @@ sub tie_for_persistent_memoization {
 	my $hash = shift;
 	my $path = shift;
 
-	if ($can_use_yaml) {
+	unless ($memo_backend) {
+		if (eval { require Git::SVN::Memoize::YAML; 1}) {
+			$memo_backend = 1;
+		} else {
+			require Memoize::Storable;
+			$memo_backend = -1;
+		}
+	}
+
+	if ($memo_backend > 0) {
 		tie %$hash => 'Git::SVN::Memoize::YAML', "$path.yaml";
 	} else {
 		tie %$hash => 'Memoize::Storable', "$path.db", 'nstore';
@@ -1597,9 +1670,8 @@ sub tie_for_persistent_memoization {
 		mkpath([$cache_path]) unless -d $cache_path;
 
 		my %lookup_svn_merge_cache;
-		my %check_cherry_pick_cache;
+		my %check_cherry_pick2_cache;
 		my %has_no_changes_cache;
-		my %_rev_list_cache;
 
 		tie_for_persistent_memoization(\%lookup_svn_merge_cache,
 		    "$cache_path/lookup_svn_merge");
@@ -1608,11 +1680,11 @@ sub tie_for_persistent_memoization {
 			LIST_CACHE => ['HASH' => \%lookup_svn_merge_cache],
 		;
 
-		tie_for_persistent_memoization(\%check_cherry_pick_cache,
-		    "$cache_path/check_cherry_pick");
-		memoize 'check_cherry_pick',
+		tie_for_persistent_memoization(\%check_cherry_pick2_cache,
+		    "$cache_path/check_cherry_pick2");
+		memoize 'check_cherry_pick2',
 			SCALAR_CACHE => 'FAULT',
-			LIST_CACHE => ['HASH' => \%check_cherry_pick_cache],
+			LIST_CACHE => ['HASH' => \%check_cherry_pick2_cache],
 		;
 
 		tie_for_persistent_memoization(\%has_no_changes_cache,
@@ -1621,14 +1693,6 @@ sub tie_for_persistent_memoization {
 			SCALAR_CACHE => ['HASH' => \%has_no_changes_cache],
 			LIST_CACHE => 'FAULT',
 		;
-
-		tie_for_persistent_memoization(\%_rev_list_cache,
-		    "$cache_path/_rev_list");
-		memoize '_rev_list',
-			SCALAR_CACHE => 'FAULT',
-			LIST_CACHE => ['HASH' => \%_rev_list_cache],
-		;
-
 	}
 
 	sub unmemoize_svn_mergeinfo_functions {
@@ -1636,9 +1700,8 @@ sub tie_for_persistent_memoization {
 		$memoized = 0;
 
 		Memoize::unmemoize 'lookup_svn_merge';
-		Memoize::unmemoize 'check_cherry_pick';
+		Memoize::unmemoize 'check_cherry_pick2';
 		Memoize::unmemoize 'has_no_changes';
-		Memoize::unmemoize '_rev_list';
 	}
 
 	sub clear_memoized_mergeinfo_caches {
@@ -1648,7 +1711,8 @@ sub tie_for_persistent_memoization {
 		return unless -d $cache_path;
 
 		for my $cache_file (("$cache_path/lookup_svn_merge",
-				     "$cache_path/check_cherry_pick",
+				     "$cache_path/check_cherry_pick", # old
+				     "$cache_path/check_cherry_pick2",
 				     "$cache_path/has_no_changes")) {
 			for my $suffix (qw(yaml db)) {
 				my $file = "$cache_file.$suffix";
@@ -1702,11 +1766,49 @@ sub parents_exclude {
 	return @excluded;
 }
 
+# Compute what's new in svn:mergeinfo.
+sub mergeinfo_changes {
+	my ($self, $old_path, $old_rev, $path, $rev, $mergeinfo_prop) = @_;
+	my %minfo = map {split ":", $_ } split "\n", $mergeinfo_prop;
+	my $old_minfo = {};
+
+	my $ra = $self->ra;
+	# Give up if $old_path isn't in the repo.
+	# This is probably a merge on a subtree.
+	if ($ra->check_path($old_path, $old_rev) != $SVN::Node::dir) {
+		warn "W: ignoring svn:mergeinfo on $old_path, ",
+			"directory didn't exist in r$old_rev\n";
+		return {};
+	}
+	my (undef, undef, $props) = $ra->get_dir($old_path, $old_rev);
+	if (defined $props->{"svn:mergeinfo"}) {
+		my %omi = map {split ":", $_ } split "\n",
+			$props->{"svn:mergeinfo"};
+		$old_minfo = \%omi;
+	}
+
+	my %changes = ();
+	foreach my $p (keys %minfo) {
+		my $a = $old_minfo->{$p} || "";
+		my $b = $minfo{$p};
+		# Omit merged branches whose ranges lists are unchanged.
+		next if $a eq $b;
+		# Remove any common range list prefix.
+		($a ^ $b) =~ /^[\0]*/;
+		my $common_prefix = rindex $b, ",", $+[0] - 1;
+		$changes{$p} = substr $b, $common_prefix + 1;
+	}
+	print STDERR "Checking svn:mergeinfo changes since r$old_rev: ",
+		scalar(keys %minfo), " sources, ",
+		scalar(keys %changes), " changed\n";
+
+	return \%changes;
+}
 
 # note: this function should only be called if the various dirprops
 # have actually changed
 sub find_extra_svn_parents {
-	my ($self, $ed, $mergeinfo, $parents) = @_;
+	my ($self, $mergeinfo, $parents) = @_;
 	# aha!  svk:merge property changed...
 
 	memoize_svn_mergeinfo_functions();
@@ -1715,14 +1817,15 @@ sub find_extra_svn_parents {
 	# history.  Then, we figure out which git revisions are in
 	# that tip, but not this revision.  If all of those revisions
 	# are now marked as merge, we can add the tip as a parent.
-	my @merges = split "\n", $mergeinfo;
+	my @merges = sort keys %$mergeinfo;
 	my @merge_tips;
 	my $url = $self->url;
 	my $uuid = $self->ra_uuid;
 	my @all_ranges;
 	for my $merge ( @merges ) {
 		my ($tip_commit, @ranges) =
-			lookup_svn_merge( $uuid, $url, $merge );
+			lookup_svn_merge( $uuid, $url,
+					  $merge, $mergeinfo->{$merge} );
 		unless (!$tip_commit or
 				grep { $_ eq $tip_commit } @$parents ) {
 			push @merge_tips, $tip_commit;
@@ -1738,8 +1841,9 @@ sub find_extra_svn_parents {
 	# check merge tips for new parents
 	my @new_parents;
 	for my $merge_tip ( @merge_tips ) {
-		my $spec = shift @merges;
+		my $merge = shift @merges;
 		next unless $merge_tip and $excluded{$merge_tip};
+		my $spec = "$merge:$mergeinfo->{$merge}";
 
 		# check out 'new' tips
 		my $merge_base;
@@ -1759,19 +1863,17 @@ sub find_extra_svn_parents {
 		}
 
 		# double check that there are no missing non-merge commits
-		my (@incomplete) = check_cherry_pick(
+		my ($ninc, $ifirst) = check_cherry_pick2(
 			$merge_base, $merge_tip,
 			$parents,
 			@all_ranges,
 		       );
 
-		if ( @incomplete ) {
-			warn "W:svn cherry-pick ignored ($spec) - missing "
-				.@incomplete." commit(s) (eg $incomplete[0])\n";
+		if ($ninc) {
+			warn "W: svn cherry-pick ignored ($spec) - missing " .
+				"$ninc commit(s) (eg $ifirst)\n";
 		} else {
-			warn
-				"Found merge parent (svn:mergeinfo prop): ",
-					$merge_tip, "\n";
+			warn "Found merge parent ($spec): ", $merge_tip, "\n";
 			push @new_parents, $merge_tip;
 		}
 	}
@@ -1797,23 +1899,20 @@ sub find_extra_svn_parents {
 }
 
 sub make_log_entry {
-	my ($self, $rev, $parents, $ed) = @_;
+	my ($self, $rev, $parents, $ed, $parent_rev, $parent_path) = @_;
 	my $untracked = $self->get_untracked($ed);
 
 	my @parents = @$parents;
-	my $ps = $ed->{path_strip} || "";
-	for my $path ( grep { m/$ps/ } %{$ed->{dir_prop}} ) {
-		my $props = $ed->{dir_prop}{$path};
-		if ( $props->{"svk:merge"} ) {
-			$self->find_extra_svk_parents
-				($ed, $props->{"svk:merge"}, \@parents);
-		}
-		if ( $props->{"svn:mergeinfo"} ) {
-			$self->find_extra_svn_parents
-				($ed,
-				 $props->{"svn:mergeinfo"},
-				 \@parents);
-		}
+	my $props = $ed->{dir_prop}{$self->path};
+	if ( $props->{"svk:merge"} ) {
+		$self->find_extra_svk_parents($props->{"svk:merge"}, \@parents);
+	}
+	if ( $props->{"svn:mergeinfo"} ) {
+		my $mi_changes = $self->mergeinfo_changes
+			($parent_path, $parent_rev,
+			 $self->path, $rev,
+			 $props->{"svn:mergeinfo"});
+		$self->find_extra_svn_parents($mi_changes, \@parents);
 	}
 
 	open my $un, '>>', "$self->{dir}/unhandled.log" or croak $!;
@@ -2161,8 +2260,9 @@ sub rev_map_set {
 	# both of these options make our .rev_db file very, very important
 	# and we can't afford to lose it because rebuild() won't work
 	if ($self->use_svm_props || $self->no_metadata) {
+		require File::Copy;
 		$sync = 1;
-		copy($db, $db_lock) or die "rev_map_set(@_): ",
+		File::Copy::copy($db, $db_lock) or die "rev_map_set(@_): ",
 					   "Failed to copy: ",
 					   "$db => $db_lock ($!)\n";
 	} else {
@@ -2338,7 +2438,7 @@ sub _new {
 
 	# Older repos imported by us used $GIT_DIR/svn/foo instead of
 	# $GIT_DIR/svn/refs/remotes/foo when tracking refs/remotes/foo
-	if ($ref_id =~ m{^refs/remotes/(.*)}) {
+	if ($ref_id =~ m{^refs/remotes/(.+)}) {
 		my $old_dir = "$ENV{GIT_DIR}/svn/$1";
 		if (-d $old_dir && ! -d $dir) {
 			$dir = $old_dir;

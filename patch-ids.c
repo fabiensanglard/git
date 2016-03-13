@@ -8,10 +8,10 @@ static int commit_patch_id(struct commit *commit, struct diff_options *options,
 		    unsigned char *sha1)
 {
 	if (commit->parents)
-		diff_tree_sha1(commit->parents->item->object.sha1,
-		               commit->object.sha1, "", options);
+		diff_tree_sha1(commit->parents->item->object.oid.hash,
+			       commit->object.oid.hash, "", options);
 	else
-		diff_root_tree_sha1(commit->object.sha1, "", options);
+		diff_root_tree_sha1(commit->object.oid.hash, "", options);
 	diffcore_std(options);
 	return diff_flush_patch_id(options, sha1);
 }
@@ -83,10 +83,7 @@ static struct patch_id *add_commit(struct commit *commit,
 	ent = &bucket->bucket[bucket->nr++];
 	hashcpy(ent->patch_id, sha1);
 
-	if (ids->alloc <= ids->nr) {
-		ids->alloc = alloc_nr(ids->nr);
-		ids->table = xrealloc(ids->table, sizeof(ent) * ids->alloc);
-	}
+	ALLOC_GROW(ids->table, ids->nr + 1, ids->alloc);
 	if (pos < ids->nr)
 		memmove(ids->table + pos + 1, ids->table + pos,
 			sizeof(ent) * (ids->nr - pos));

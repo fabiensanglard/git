@@ -3,8 +3,9 @@
  * Fredrik Kuivinen.
  * The thieves were Alex Riesen and Johannes Schindelin, in June/July 2006
  */
-#include "advice.h"
 #include "cache.h"
+#include "advice.h"
+#include "lockfile.h"
 #include "cache-tree.h"
 #include "commit.h"
 #include "blob.h"
@@ -25,22 +26,22 @@
 static struct tree *shift_tree_object(struct tree *one, struct tree *two,
 				      const char *subtree_shift)
 {
-	unsigned char shifted[20];
+	struct object_id shifted;
 
 	if (!*subtree_shift) {
-		shift_tree(one->object.sha1, two->object.sha1, shifted, 0);
+		shift_tree(one->object.oid.hash, two->object.oid.hash, shifted.hash, 0);
 	} else {
-		shift_tree_by(one->object.sha1, two->object.sha1, shifted,
+		shift_tree_by(one->object.oid.hash, two->object.oid.hash, shifted.hash,
 			      subtree_shift);
 	}
-	if (!hashcmp(two->object.sha1, shifted))
+	if (!oidcmp(&two->object.oid, &shifted))
 		return two;
-	return lookup_tree(shifted);
+	return lookup_tree(shifted.hash);
 }
 
 static struct commit *make_virtual_commit(struct tree *tree, const char *comment)
 {
-	struct commit *commit = xcalloc(1, sizeof(struct commit));
+	struct commit *commit = alloc_commit_node();
 	struct merge_remote_desc *desc = xmalloc(sizeof(*desc));
 
 	desc->name = comment;
@@ -163,15 +164,13 @@ static void output(struct merge_options *o, int v, const char *fmt, ...)
 	if (!show(o, v))
 		return;
 
-	strbuf_grow(&o->obuf, o->call_depth * 2 + 2);
-	memset(o->obuf.buf + o->obuf.len, ' ', o->call_depth * 2);
-	strbuf_setlen(&o->obuf, o->obuf.len + o->call_depth * 2);
+	strbuf_addchars(&o->obuf, ' ', o->call_depth * 2);
 
 	va_start(ap, fmt);
 	strbuf_vaddf(&o->obuf, fmt, ap);
 	va_end(ap);
 
-	strbuf_add(&o->obuf, "\n", 1);
+	strbuf_addch(&o->obuf, '\n');
 	if (!o->buffer_output)
 		flush_output(o);
 }
@@ -185,14 +184,16 @@ static void output_commit_title(struct merge_options *o, struct commit *commit)
 	if (commit->util)
 		printf("virtual %s\n", merge_remote_util(commit)->name);
 	else {
-		printf("%s ", find_unique_abbrev(commit->object.sha1, DEFAULT_ABBREV));
+		printf("%s ", find_unique_abbrev(commit->object.oid.hash, DEFAULT_ABBREV));
 		if (parse_commit(commit) != 0)
 			printf(_("(bad commit)\n"));
 		else {
 			const char *title;
-			int len = find_commit_subject(commit->buffer, &title);
+			const char *msg = get_commit_buffer(commit, NULL);
+			int len = find_commit_subject(msg, &title);
 			if (len)
 				printf("%.*s\n", len, title);
+			unuse_commit_buffer(commit, msg);
 		}
 	}
 }
@@ -265,9 +266,7 @@ struct tree *write_tree_from_memory(struct merge_options *o)
 		active_cache_tree = cache_tree();
 
 	if (!cache_tree_fully_valid(active_cache_tree) &&
-	    cache_tree_update(active_cache_tree,
-			      (const struct cache_entry * const *)active_cache,
-			      active_nr, 0) < 0)
+	    cache_tree_update(&the_index, 0) < 0)
 		die(_("error building trees"));
 
 	result = lookup_tree(active_cache_tree->sha1);
@@ -276,23 +275,20 @@ struct tree *write_tree_from_memory(struct merge_options *o)
 }
 
 static int save_files_dirs(const unsigned char *sha1,
-		const char *base, int baselen, const char *path,
+		struct strbuf *base, const char *path,
 		unsigned int mode, int stage, void *context)
 {
-	int len = strlen(path);
-	char *newpath = xmalloc(baselen + len + 1);
+	int baselen = base->len;
 	struct merge_options *o = context;
 
-	memcpy(newpath, base, baselen);
-	memcpy(newpath + baselen, path, len);
-	newpath[baselen + len] = '\0';
+	strbuf_addstr(base, path);
 
 	if (S_ISDIR(mode))
-		string_list_insert(&o->current_directory_set, newpath);
+		string_list_insert(&o->current_directory_set, base->buf);
 	else
-		string_list_insert(&o->current_file_set, newpath);
-	free(newpath);
+		string_list_insert(&o->current_file_set, base->buf);
 
+	strbuf_setlen(base, baselen);
 	return (S_ISDIR(mode) ? READ_TREE_RECURSIVE : 0);
 }
 
@@ -317,11 +313,11 @@ static struct stage_data *insert_stage_data(const char *path,
 {
 	struct string_list_item *item;
 	struct stage_data *e = xcalloc(1, sizeof(struct stage_data));
-	get_tree_entry(o->object.sha1, path,
+	get_tree_entry(o->object.oid.hash, path,
 			e->stages[1].sha, &e->stages[1].mode);
-	get_tree_entry(a->object.sha1, path,
+	get_tree_entry(a->object.oid.hash, path,
 			e->stages[2].sha, &e->stages[2].mode);
-	get_tree_entry(b->object.sha1, path,
+	get_tree_entry(b->object.oid.hash, path,
 			e->stages[3].sha, &e->stages[3].mode);
 	item = string_list_insert(entries, path);
 	item->util = e;
@@ -486,6 +482,9 @@ static struct string_list *get_renames(struct merge_options *o,
 	struct diff_options opts;
 
 	renames = xcalloc(1, sizeof(struct string_list));
+	if (!o->detect_rename)
+		return renames;
+
 	diff_setup(&opts);
 	DIFF_OPT_SET(&opts, RECURSIVE);
 	DIFF_OPT_CLR(&opts, RENAME_EMPTY);
@@ -497,7 +496,7 @@ static struct string_list *get_renames(struct merge_options *o,
 	opts.show_rename_progress = o->show_rename_progress;
 	opts.output_format = DIFF_FORMAT_NO_OUTPUT;
 	diff_setup_done(&opts);
-	diff_tree_sha1(o_tree->object.sha1, tree->object.sha1, "", &opts);
+	diff_tree_sha1(o_tree->object.oid.hash, tree->object.oid.hash, "", &opts);
 	diffcore_std(&opts);
 	if (opts.needed_rename_limit > o->needed_rename_limit)
 		o->needed_rename_limit = opts.needed_rename_limit;
@@ -589,54 +588,69 @@ static int remove_file(struct merge_options *o, int clean,
 			return -1;
 	}
 	if (update_working_directory) {
+		if (ignore_case) {
+			struct cache_entry *ce;
+			ce = cache_file_exists(path, strlen(path), ignore_case);
+			if (ce && ce_stage(ce) == 0)
+				return 0;
+		}
 		if (remove_path(path))
 			return -1;
 	}
 	return 0;
 }
 
+/* add a string to a strbuf, but converting "/" to "_" */
+static void add_flattened_path(struct strbuf *out, const char *s)
+{
+	size_t i = out->len;
+	strbuf_addstr(out, s);
+	for (; i < out->len; i++)
+		if (out->buf[i] == '/')
+			out->buf[i] = '_';
+}
+
 static char *unique_path(struct merge_options *o, const char *path, const char *branch)
 {
-	char *newpath = xmalloc(strlen(path) + 1 + strlen(branch) + 8 + 1);
+	struct strbuf newpath = STRBUF_INIT;
 	int suffix = 0;
-	struct stat st;
-	char *p = newpath + strlen(path);
-	strcpy(newpath, path);
-	*(p++) = '~';
-	strcpy(p, branch);
-	for (; *p; ++p)
-		if ('/' == *p)
-			*p = '_';
-	while (string_list_has_string(&o->current_file_set, newpath) ||
-	       string_list_has_string(&o->current_directory_set, newpath) ||
-	       lstat(newpath, &st) == 0)
-		sprintf(p, "_%d", suffix++);
+	size_t base_len;
 
-	string_list_insert(&o->current_file_set, newpath);
-	return newpath;
+	strbuf_addf(&newpath, "%s~", path);
+	add_flattened_path(&newpath, branch);
+
+	base_len = newpath.len;
+	while (string_list_has_string(&o->current_file_set, newpath.buf) ||
+	       string_list_has_string(&o->current_directory_set, newpath.buf) ||
+	       file_exists(newpath.buf)) {
+		strbuf_setlen(&newpath, base_len);
+		strbuf_addf(&newpath, "_%d", suffix++);
+	}
+
+	string_list_insert(&o->current_file_set, newpath.buf);
+	return strbuf_detach(&newpath, NULL);
 }
 
 static int dir_in_way(const char *path, int check_working_copy)
 {
-	int pos, pathlen = strlen(path);
-	char *dirpath = xmalloc(pathlen + 2);
+	int pos;
+	struct strbuf dirpath = STRBUF_INIT;
 	struct stat st;
 
-	strcpy(dirpath, path);
-	dirpath[pathlen] = '/';
-	dirpath[pathlen+1] = '\0';
+	strbuf_addstr(&dirpath, path);
+	strbuf_addch(&dirpath, '/');
 
-	pos = cache_name_pos(dirpath, pathlen+1);
+	pos = cache_name_pos(dirpath.buf, dirpath.len);
 
 	if (pos < 0)
 		pos = -1 - pos;
 	if (pos < active_nr &&
-	    !strncmp(dirpath, active_cache[pos]->name, pathlen+1)) {
-		free(dirpath);
+	    !strncmp(dirpath.buf, active_cache[pos]->name, dirpath.len)) {
+		strbuf_release(&dirpath);
 		return 1;
 	}
 
-	free(dirpath);
+	strbuf_release(&dirpath);
 	return check_working_copy && !lstat(path, &st) && S_ISDIR(st.st_mode);
 }
 
@@ -963,14 +977,10 @@ merge_file_special_markers(struct merge_options *o,
 	char *side2 = NULL;
 	struct merge_file_info mfi;
 
-	if (filename1) {
-		side1 = xmalloc(strlen(branch1) + strlen(filename1) + 2);
-		sprintf(side1, "%s:%s", branch1, filename1);
-	}
-	if (filename2) {
-		side2 = xmalloc(strlen(branch2) + strlen(filename2) + 2);
-		sprintf(side2, "%s:%s", branch2, filename2);
-	}
+	if (filename1)
+		side1 = xstrfmt("%s:%s", branch1, filename1);
+	if (filename2)
+		side2 = xstrfmt("%s:%s", branch2, filename2);
 
 	mfi = merge_file_1(o, one, a, b,
 			   side1 ? side1 : branch1, side2 ? side2 : branch2);
@@ -1523,13 +1533,17 @@ static int read_sha1_strbuf(const unsigned char *sha1, struct strbuf *dst)
 }
 
 static int blob_unchanged(const unsigned char *o_sha,
+			  unsigned o_mode,
 			  const unsigned char *a_sha,
+			  unsigned a_mode,
 			  int renormalize, const char *path)
 {
 	struct strbuf o = STRBUF_INIT;
 	struct strbuf a = STRBUF_INIT;
 	int ret = 0; /* assume changed for safety */
 
+	if (a_mode != o_mode)
+		return 0;
 	if (sha_eq(o_sha, a_sha))
 		return 1;
 	if (!renormalize)
@@ -1544,7 +1558,7 @@ static int blob_unchanged(const unsigned char *o_sha,
 	 * unchanged since their sha1s have already been compared.
 	 */
 	if (renormalize_buffer(path, o.buf, o.len, &o) |
-	    renormalize_buffer(path, a.buf, o.len, &a))
+	    renormalize_buffer(path, a.buf, a.len, &a))
 		ret = (o.len == a.len && !memcmp(o.buf, a.buf, o.len));
 
 error_return:
@@ -1675,10 +1689,6 @@ static int merge_content(struct merge_options *o,
 static int process_entry(struct merge_options *o,
 			 const char *path, struct stage_data *entry)
 {
-	/*
-	printf("processing entry, clean cache: %s\n", index_only ? "yes": "no");
-	print_index_entry("\tpath: ", entry);
-	*/
 	int clean_merge = 1;
 	int normalize = o->renormalize;
 	unsigned o_mode = entry->stages[1].mode;
@@ -1719,8 +1729,8 @@ static int process_entry(struct merge_options *o,
 	} else if (o_sha && (!a_sha || !b_sha)) {
 		/* Case A: Deleted in one */
 		if ((!a_sha && !b_sha) ||
-		    (!b_sha && blob_unchanged(o_sha, a_sha, normalize, path)) ||
-		    (!a_sha && blob_unchanged(o_sha, b_sha, normalize, path))) {
+		    (!b_sha && blob_unchanged(o_sha, o_mode, a_sha, a_mode, normalize, path)) ||
+		    (!a_sha && blob_unchanged(o_sha, o_mode, b_sha, b_mode, normalize, path))) {
 			/* Deleted in both or deleted in one and
 			 * unchanged in the other */
 			if (a_sha)
@@ -1805,7 +1815,7 @@ int merge_trees(struct merge_options *o,
 		common = shift_tree_object(head, common, o->subtree_shift);
 	}
 
-	if (sha_eq(common->object.sha1, merge->object.sha1)) {
+	if (sha_eq(common->object.oid.hash, merge->object.oid.hash)) {
 		output(o, 0, _("Already up-to-date!"));
 		*result = head;
 		return 1;
@@ -1816,8 +1826,8 @@ int merge_trees(struct merge_options *o,
 	if (code != 0) {
 		if (show(o, 4) || o->call_depth)
 			die(_("merging of trees %s and %s failed"),
-			    sha1_to_hex(head->object.sha1),
-			    sha1_to_hex(merge->object.sha1));
+			    oid_to_hex(&head->object.oid),
+			    oid_to_hex(&merge->object.oid));
 		else
 			exit(128);
 	}
@@ -1853,6 +1863,9 @@ int merge_trees(struct merge_options *o,
 		string_list_clear(re_head, 0);
 		string_list_clear(entries, 1);
 
+		free(re_merge);
+		free(re_head);
+		free(entries);
 	}
 	else
 		clean = 1;
@@ -1896,7 +1909,7 @@ int merge_recursive(struct merge_options *o,
 	}
 
 	if (!ca) {
-		ca = get_merge_bases(h1, h2, 1);
+		ca = get_merge_bases(h1, h2);
 		ca = reverse_commit_list(ca);
 	}
 
@@ -1986,7 +1999,7 @@ int merge_recursive_generic(struct merge_options *o,
 			    const unsigned char **base_list,
 			    struct commit **result)
 {
-	int clean, index_fd;
+	int clean;
 	struct lock_file *lock = xcalloc(1, sizeof(struct lock_file));
 	struct commit *head_commit = get_ref(head, o->branch1);
 	struct commit *next_commit = get_ref(merge, o->branch2);
@@ -2003,33 +2016,22 @@ int merge_recursive_generic(struct merge_options *o,
 		}
 	}
 
-	index_fd = hold_locked_index(lock, 1);
+	hold_locked_index(lock, 1);
 	clean = merge_recursive(o, head_commit, next_commit, ca,
 			result);
 	if (active_cache_changed &&
-			(write_cache(index_fd, active_cache, active_nr) ||
-			 commit_locked_index(lock)))
+	    write_locked_index(&the_index, lock, COMMIT_LOCK))
 		return error(_("Unable to write index."));
 
 	return clean ? 0 : 1;
 }
 
-static int merge_recursive_config(const char *var, const char *value, void *cb)
+static void merge_recursive_config(struct merge_options *o)
 {
-	struct merge_options *o = cb;
-	if (!strcmp(var, "merge.verbosity")) {
-		o->verbosity = git_config_int(var, value);
-		return 0;
-	}
-	if (!strcmp(var, "diff.renamelimit")) {
-		o->diff_rename_limit = git_config_int(var, value);
-		return 0;
-	}
-	if (!strcmp(var, "merge.renamelimit")) {
-		o->merge_rename_limit = git_config_int(var, value);
-		return 0;
-	}
-	return git_xmerge_config(var, value, cb);
+	git_config_get_int("merge.verbosity", &o->verbosity);
+	git_config_get_int("diff.renamelimit", &o->diff_rename_limit);
+	git_config_get_int("merge.renamelimit", &o->merge_rename_limit);
+	git_config(git_xmerge_config, NULL);
 }
 
 void init_merge_options(struct merge_options *o)
@@ -2040,23 +2042,23 @@ void init_merge_options(struct merge_options *o)
 	o->diff_rename_limit = -1;
 	o->merge_rename_limit = -1;
 	o->renormalize = 0;
-	git_config(merge_recursive_config, o);
+	o->detect_rename = 1;
+	merge_recursive_config(o);
 	if (getenv("GIT_MERGE_VERBOSITY"))
 		o->verbosity =
 			strtol(getenv("GIT_MERGE_VERBOSITY"), NULL, 10);
 	if (o->verbosity >= 5)
 		o->buffer_output = 0;
 	strbuf_init(&o->obuf, 0);
-	memset(&o->current_file_set, 0, sizeof(struct string_list));
-	o->current_file_set.strdup_strings = 1;
-	memset(&o->current_directory_set, 0, sizeof(struct string_list));
-	o->current_directory_set.strdup_strings = 1;
-	memset(&o->df_conflict_file_set, 0, sizeof(struct string_list));
-	o->df_conflict_file_set.strdup_strings = 1;
+	string_list_init(&o->current_file_set, 1);
+	string_list_init(&o->current_directory_set, 1);
+	string_list_init(&o->df_conflict_file_set, 1);
 }
 
 int parse_merge_opt(struct merge_options *o, const char *s)
 {
+	const char *arg;
+
 	if (!s || !*s)
 		return -1;
 	if (!strcmp(s, "ours"))
@@ -2065,14 +2067,14 @@ int parse_merge_opt(struct merge_options *o, const char *s)
 		o->recursive_variant = MERGE_RECURSIVE_THEIRS;
 	else if (!strcmp(s, "subtree"))
 		o->subtree_shift = "";
-	else if (starts_with(s, "subtree="))
-		o->subtree_shift = s + strlen("subtree=");
+	else if (skip_prefix(s, "subtree=", &arg))
+		o->subtree_shift = arg;
 	else if (!strcmp(s, "patience"))
 		o->xdl_opts = DIFF_WITH_ALG(o, PATIENCE_DIFF);
 	else if (!strcmp(s, "histogram"))
 		o->xdl_opts = DIFF_WITH_ALG(o, HISTOGRAM_DIFF);
-	else if (starts_with(s, "diff-algorithm=")) {
-		long value = parse_algorithm_value(s + strlen("diff-algorithm="));
+	else if (skip_prefix(s, "diff-algorithm=", &arg)) {
+		long value = parse_algorithm_value(arg);
 		if (value < 0)
 			return -1;
 		/* clear out previous settings */
@@ -2090,10 +2092,17 @@ int parse_merge_opt(struct merge_options *o, const char *s)
 		o->renormalize = 1;
 	else if (!strcmp(s, "no-renormalize"))
 		o->renormalize = 0;
-	else if (starts_with(s, "rename-threshold=")) {
-		const char *score = s + strlen("rename-threshold=");
-		if ((o->rename_score = parse_rename_score(&score)) == -1 || *score != 0)
+	else if (!strcmp(s, "no-renames"))
+		o->detect_rename = 0;
+	else if (!strcmp(s, "find-renames")) {
+		o->detect_rename = 1;
+		o->rename_score = 0;
+	}
+	else if (skip_prefix(s, "find-renames=", &arg) ||
+		 skip_prefix(s, "rename-threshold=", &arg)) {
+		if ((o->rename_score = parse_rename_score(&arg)) == -1 || *arg != 0)
 			return -1;
+		o->detect_rename = 1;
 	}
 	else
 		return -1;

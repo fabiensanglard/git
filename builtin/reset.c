@@ -8,6 +8,7 @@
  * Copyright (c) 2005, 2006 Linus Torvalds and Junio C Hamano
  */
 #include "builtin.h"
+#include "lockfile.h"
 #include "tag.h"
 #include "object.h"
 #include "commit.h"
@@ -35,7 +36,7 @@ static const char *reset_type_names[] = {
 
 static inline int is_merge(void)
 {
-	return !access(git_path("MERGE_HEAD"), F_OK);
+	return !access(git_path_merge_head(), F_OK);
 }
 
 static int reset_index(const unsigned char *sha1, int reset_type, int quiet)
@@ -84,7 +85,7 @@ static int reset_index(const unsigned char *sha1, int reset_type, int quiet)
 
 	if (reset_type == MIXED || reset_type == HARD) {
 		tree = parse_tree_indirect(sha1);
-		prime_cache_tree(&active_cache_tree, tree);
+		prime_cache_tree(&the_index, tree);
 	}
 
 	return 0;
@@ -93,9 +94,9 @@ static int reset_index(const unsigned char *sha1, int reset_type, int quiet)
 static void print_new_head_line(struct commit *commit)
 {
 	const char *hex, *body;
-	char *msg;
+	const char *msg;
 
-	hex = find_unique_abbrev(commit->object.sha1, DEFAULT_ABBREV);
+	hex = find_unique_abbrev(commit->object.oid.hash, DEFAULT_ABBREV);
 	printf(_("HEAD is now at %s"), hex);
 	msg = logmsg_reencode(commit, NULL, get_log_output_encoding());
 	body = strstr(msg, "\n\n");
@@ -109,7 +110,7 @@ static void print_new_head_line(struct commit *commit)
 	}
 	else
 		printf("\n");
-	logmsg_free(msg, commit);
+	unuse_commit_buffer(commit, msg);
 }
 
 static void update_index_from_diff(struct diff_queue_struct *q,
@@ -252,11 +253,13 @@ static int reset_refs(const char *rev, const unsigned char *sha1)
 	if (!get_sha1("HEAD", sha1_orig)) {
 		orig = sha1_orig;
 		set_reflog_message(&msg, "updating ORIG_HEAD", NULL);
-		update_ref(msg.buf, "ORIG_HEAD", orig, old_orig, 0, MSG_ON_ERR);
+		update_ref(msg.buf, "ORIG_HEAD", orig, old_orig, 0,
+			   UPDATE_REFS_MSG_ON_ERR);
 	} else if (old_orig)
 		delete_ref("ORIG_HEAD", old_orig, 0);
 	set_reflog_message(&msg, "updating HEAD", rev);
-	update_ref_status = update_ref(msg.buf, "HEAD", sha1, orig, 0, MSG_ON_ERR);
+	update_ref_status = update_ref(msg.buf, "HEAD", sha1, orig, 0,
+				       UPDATE_REFS_MSG_ON_ERR);
 	strbuf_release(&msg);
 	return update_ref_status;
 }
@@ -266,7 +269,7 @@ int cmd_reset(int argc, const char **argv, const char *prefix)
 	int reset_type = NONE, update_ref_status = 0, quiet = 0;
 	int patch_mode = 0, unborn;
 	const char *rev;
-	unsigned char sha1[20];
+	struct object_id oid;
 	struct pathspec pathspec;
 	int intent_to_add = 0;
 	const struct option options[] = {
@@ -292,26 +295,26 @@ int cmd_reset(int argc, const char **argv, const char *prefix)
 						PARSE_OPT_KEEP_DASHDASH);
 	parse_args(&pathspec, argv, prefix, patch_mode, &rev);
 
-	unborn = !strcmp(rev, "HEAD") && get_sha1("HEAD", sha1);
+	unborn = !strcmp(rev, "HEAD") && get_sha1("HEAD", oid.hash);
 	if (unborn) {
 		/* reset on unborn branch: treat as reset to empty tree */
-		hashcpy(sha1, EMPTY_TREE_SHA1_BIN);
+		hashcpy(oid.hash, EMPTY_TREE_SHA1_BIN);
 	} else if (!pathspec.nr) {
 		struct commit *commit;
-		if (get_sha1_committish(rev, sha1))
+		if (get_sha1_committish(rev, oid.hash))
 			die(_("Failed to resolve '%s' as a valid revision."), rev);
-		commit = lookup_commit_reference(sha1);
+		commit = lookup_commit_reference(oid.hash);
 		if (!commit)
 			die(_("Could not parse object '%s'."), rev);
-		hashcpy(sha1, commit->object.sha1);
+		oidcpy(&oid, &commit->object.oid);
 	} else {
 		struct tree *tree;
-		if (get_sha1_treeish(rev, sha1))
+		if (get_sha1_treeish(rev, oid.hash))
 			die(_("Failed to resolve '%s' as a valid tree."), rev);
-		tree = parse_tree_indirect(sha1);
+		tree = parse_tree_indirect(oid.hash);
 		if (!tree)
 			die(_("Could not parse object '%s'."), rev);
-		hashcpy(sha1, tree->object.sha1);
+		oidcpy(&oid, &tree->object.oid);
 	}
 
 	if (patch_mode) {
@@ -351,34 +354,33 @@ int cmd_reset(int argc, const char **argv, const char *prefix)
 
 	if (reset_type != SOFT) {
 		struct lock_file *lock = xcalloc(1, sizeof(*lock));
-		int newfd = hold_locked_index(lock, 1);
+		hold_locked_index(lock, 1);
 		if (reset_type == MIXED) {
 			int flags = quiet ? REFRESH_QUIET : REFRESH_IN_PORCELAIN;
-			if (read_from_tree(&pathspec, sha1, intent_to_add))
+			if (read_from_tree(&pathspec, oid.hash, intent_to_add))
 				return 1;
 			if (get_git_work_tree())
 				refresh_index(&the_index, flags, NULL, NULL,
 					      _("Unstaged changes after reset:"));
 		} else {
-			int err = reset_index(sha1, reset_type, quiet);
+			int err = reset_index(oid.hash, reset_type, quiet);
 			if (reset_type == KEEP && !err)
-				err = reset_index(sha1, MIXED, quiet);
+				err = reset_index(oid.hash, MIXED, quiet);
 			if (err)
 				die(_("Could not reset index file to revision '%s'."), rev);
 		}
 
-		if (write_cache(newfd, active_cache, active_nr) ||
-		    commit_locked_index(lock))
+		if (write_locked_index(&the_index, lock, COMMIT_LOCK))
 			die(_("Could not write new index file."));
 	}
 
 	if (!pathspec.nr && !unborn) {
 		/* Any resets without paths update HEAD to the head being
 		 * switched to, saving the previous head in ORIG_HEAD before. */
-		update_ref_status = reset_refs(rev, sha1);
+		update_ref_status = reset_refs(rev, oid.hash);
 
 		if (reset_type == HARD && !update_ref_status && !quiet)
-			print_new_head_line(lookup_commit_reference(sha1));
+			print_new_head_line(lookup_commit_reference(oid.hash));
 	}
 	if (!pathspec.nr)
 		remove_branch_state();

@@ -4,9 +4,15 @@
 
 int quote_path_fully = 1;
 
+static inline int need_bs_quote(char c)
+{
+	return (c == '\'' || c == '!');
+}
+
 /* Help to copy the thing properly quoted for the shell safety.
  * any single quote is replaced with '\'', any exclamation point
  * is replaced with '\!', and the whole thing is enclosed in a
+ * single quote pair.
  *
  * E.g.
  *  original     sq_quote     result
@@ -15,11 +21,6 @@ int quote_path_fully = 1;
  *  a'b      ==> a'\''b    ==> 'a'\''b'
  *  a!b      ==> a'\!'b    ==> 'a'\!'b'
  */
-static inline int need_bs_quote(char c)
-{
-	return (c == '\'' || c == '!');
-}
-
 void sq_quote_buf(struct strbuf *dst, const char *src)
 {
 	char *to_free = NULL;
@@ -269,27 +270,6 @@ void write_name_quoted(const char *name, FILE *fp, int terminator)
 	if (terminator) {
 		quote_c_style(name, NULL, fp, 0);
 	} else {
-		fputs(name, fp);
-	}
-	fputc(terminator, fp);
-}
-
-void write_name_quotedpfx(const char *pfx, size_t pfxlen,
-			  const char *name, FILE *fp, int terminator)
-{
-	int needquote = 0;
-
-	if (terminator) {
-		needquote = next_quote_pos(pfx, pfxlen) < pfxlen
-			|| name[next_quote_pos(name, -1)];
-	}
-	if (needquote) {
-		fputc('"', fp);
-		quote_c_style_counted(pfx, pfxlen, NULL, fp, 1);
-		quote_c_style(name, NULL, fp, 1);
-		fputc('"', fp);
-	} else {
-		fwrite(pfx, pfxlen, 1, fp);
 		fputs(name, fp);
 	}
 	fputc(terminator, fp);
